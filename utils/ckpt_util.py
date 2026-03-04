@@ -1,25 +1,40 @@
-import jax
-from flax.training import checkpoints
+import os
+
+import torch
 
 from utils.logging_util import log_for_0
 
 
 def restore_checkpoint(state, workdir):
     """
-    Restores the model state from a checkpoint located in the specified working directory.
+    Restore a checkpoint saved by ``save_checkpoint`` into a train-state-like object.
     """
-    state = checkpoints.restore_checkpoint(workdir, state)
-    log_for_0("Restored from checkpoint at {}".format(workdir))
+    path = workdir
+    if os.path.isdir(path):
+        path = os.path.join(path, "checkpoint_last.pt")
+    if not os.path.exists(path):
+        log_for_0(f"No checkpoint found at {path}.")
+        return state
+
+    ckpt = torch.load(path, map_location="cpu")
+    if hasattr(state, "load_state_dict"):
+        state.load_state_dict(ckpt)
+    else:
+        raise TypeError("state must implement load_state_dict for restore_checkpoint.")
+    log_for_0(f"Restored from checkpoint at {path}")
     return state
 
 
 def save_checkpoint(state, workdir):
     """
-    Saves the model state to a checkpoint in the specified working directory.
+    Save a train-state-like object to ``workdir/checkpoint_last.pt``.
     """
-    # Save only one copy from device 0.
-    state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], state))
-    step = int(state.step)
-    log_for_0("Saving checkpoint step %d.", step)
-    checkpoints.save_checkpoint_multiprocess(workdir, state, step, keep=3)
-    log_for_0("Checkpoint step %d saved.", step)
+    os.makedirs(workdir, exist_ok=True)
+    path = os.path.join(workdir, "checkpoint_last.pt")
+    if hasattr(state, "state_dict"):
+        ckpt = state.state_dict()
+    else:
+        raise TypeError("state must implement state_dict for save_checkpoint.")
+    torch.save(ckpt, path)
+    step = int(getattr(state, "step", 0))
+    log_for_0(f"Checkpoint step {step} saved at {path}.")

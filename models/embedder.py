@@ -1,19 +1,27 @@
 import math
-import jax.numpy as jnp
-from flax import linen as nn
 
-from models.torch_models import TorchLinear, TorchEmbedding
+import torch
+import torch.nn as nn
+
+from models.torch_models import TorchEmbedding, TorchLinear
 
 
 class TimestepEmbedder(nn.Module):
-    """Embeds a scalar timestep (or scalar conditioning) into a vector."""
+    """Embed scalar timestep/conditioning values into hidden vectors."""
 
-    hidden_size: int
-    frequency_embedding_size: int = 256
-    weight_init: str = "scaled_variance"
-    init_constant: float = 1.0
+    def __init__(
+        self,
+        hidden_size: int,
+        frequency_embedding_size: int = 256,
+        weight_init: str = "scaled_variance",
+        init_constant: float = 1.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.frequency_embedding_size = frequency_embedding_size
+        self.weight_init = weight_init
+        self.init_constant = init_constant
 
-    def setup(self):
         init_kwargs = dict(
             out_features=self.hidden_size,
             bias=True,
@@ -22,99 +30,117 @@ class TimestepEmbedder(nn.Module):
             bias_init="zeros",
         )
         self.mlp = nn.Sequential(
-            [
-                TorchLinear(self.frequency_embedding_size, **init_kwargs),
-                nn.silu,
-                TorchLinear(self.hidden_size, **init_kwargs),
-            ]
+            TorchLinear(self.frequency_embedding_size, **init_kwargs),
+            nn.SiLU(),
+            TorchLinear(self.hidden_size, **init_kwargs),
         )
 
     @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """Create sinusoidal timestep embeddings."""
+    def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000):
         half = dim // 2
-        freqs = jnp.exp(
+        freqs = torch.exp(
             -math.log(max_period)
-            * jnp.arange(start=0, stop=half, dtype=jnp.float32)
+            * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
             / half
         )
-        args = t[:, None].astype(jnp.float32) * freqs[None]
-        embedding = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
+        args = t[:, None].to(torch.float32) * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = jnp.concatenate(
-                [embedding, jnp.zeros_like(embedding[:, :1])], axis=-1
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
             )
         return embedding
 
-    def __call__(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        return self.mlp(t_freq)
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
 
 
 class LabelEmbedder(nn.Module):
-    """Embeds class labels into vector representations with token dropout."""
+    """Class label embedding (kept for compatibility with class-conditioned code)."""
 
-    num_classes: int
-    hidden_size: int
-    weight_init: str = "scaled_variance"
-    init_constant: float = 1.0
-
-    def setup(self):
+    def __init__(
+        self,
+        num_classes: int,
+        hidden_size: int,
+        weight_init: str = "scaled_variance",
+        init_constant: float = 1.0,
+    ):
+        super().__init__()
         self.embedding_table = TorchEmbedding(
-            self.num_classes + 1,
-            self.hidden_size,
-            weight_init=self.weight_init,
-            init_constant=self.init_constant,
+            num_classes + 1,
+            hidden_size,
+            weight_init=weight_init,
+            init_constant=init_constant,
         )
 
-    def __call__(self, labels):
+    def forward(self, labels: torch.Tensor) -> torch.Tensor:
         return self.embedding_table(labels)
 
 
 class BottleneckPatchEmbedder(nn.Module):
-    """Image to Patch Embedding."""
+    """Image to patch embedding with a bottleneck conv projection."""
 
-    input_size: int
-    initial_patch_size: int
-    pca_channels: int
-    in_channels: int
-    hidden_size: int
-    bias: bool = True
+    def __init__(
+        self,
+        input_size: int,
+        initial_patch_size: int,
+        pca_channels: int,
+        in_channels: int,
+        hidden_size: int,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.initial_patch_size = initial_patch_size
+        self.in_channels = in_channels
+        self.pca_channels = pca_channels
+        self.hidden_size = hidden_size
+        self.bias = bias
 
-    def setup(self):
         self.patch_size = (self.initial_patch_size, self.initial_patch_size)
-        self.img_size = self.input_size
         self.img_size, self.grid_size, self.num_patches = self._init_img_size(
-            self.img_size
+            self.input_size
         )
 
-        self.flatten = True
-        self.proj1 = nn.Conv(
+        self.proj1 = nn.Conv2d(
+            self.in_channels,
             self.pca_channels,
             kernel_size=self.patch_size,
-            strides=self.patch_size,
-            use_bias=self.bias,
-            kernel_init=nn.initializers.xavier_uniform(in_axis=(0, 1, 2), out_axis=-1),
-            bias_init=nn.initializers.zeros,
+            stride=self.patch_size,
+            bias=self.bias,
         )
-        self.proj2 = nn.Conv(
+        self.proj2 = nn.Conv2d(
+            self.pca_channels,
             self.hidden_size,
             kernel_size=(1, 1),
-            strides=(1, 1),
-            use_bias=self.bias,
-            kernel_init=nn.initializers.xavier_uniform(in_axis=(0, 1, 2), out_axis=-1),
-            bias_init=nn.initializers.zeros,
+            stride=(1, 1),
+            bias=self.bias,
         )
 
+        # Init convs like linears to match prior behavior.
+        kh = kw = self.patch_size[0]
+        fan_in = kh * kw * self.in_channels
+        fan_out = self.pca_channels
+        limit = math.sqrt(6.0 / (fan_in + fan_out))
+        nn.init.uniform_(self.proj1.weight, -limit, limit)
+
+        fan_in = self.pca_channels
+        fan_out = self.hidden_size
+        limit = math.sqrt(6.0 / (fan_in + fan_out))
+        nn.init.uniform_(self.proj2.weight, -limit, limit)
+
+        if self.bias:
+            nn.init.zeros_(self.proj1.bias)
+            nn.init.zeros_(self.proj2.bias)
 
     def _init_img_size(self, img_size: int):
         img_size = (img_size, img_size)
-        grid_size = tuple([s // p for s, p in zip(img_size, self.patch_size)])
+        grid_size = tuple(s // p for s, p in zip(img_size, self.patch_size))
         num_patches = grid_size[0] * grid_size[1]
         return img_size, grid_size, num_patches
 
-    def __call__(self, x):
-        B, H, W, C = x.shape
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W) -> (B, N, D)
         x = self.proj2(self.proj1(x))
-        x = x.reshape(B, -1, x.shape[3])
-        return x
+        b, d, h, w = x.shape
+        return x.permute(0, 2, 3, 1).reshape(b, h * w, d)

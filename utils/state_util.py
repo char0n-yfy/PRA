@@ -16,7 +16,11 @@
 
 """Utilities for manipulating training state dictionaries."""
 
-from flax import traverse_util
+from typing import Any, Dict
+
+import numpy as np
+import torch
+
 from utils.logging_util import log_for_0
 
 
@@ -33,7 +37,7 @@ def tensorstore_leaf(_, value):
     # It is a tensorstore leaf if it at least has `driver`, `kvstore` and
     # `metadata` in its keys, sometime they have additional ones like `dtype` or
     # `transform`.
-    return set(value.keys()) >= {"driver", "kvstore", "metadata"}
+    return isinstance(value, dict) and set(value.keys()) >= {"driver", "kvstore", "metadata"}
 
 
 def flatten_state_dict(state_dict, keep_empty_nodes: bool = False):
@@ -48,24 +52,62 @@ def flatten_state_dict(state_dict, keep_empty_nodes: bool = False):
     Returns:
       Flattened dictionary, though keeping tensor store state unflattened.
     """
-    return traverse_util.flatten_dict(
-        state_dict, is_leaf=tensorstore_leaf, keep_empty_nodes=keep_empty_nodes, sep="/"
-    )
+    out: Dict[str, Any] = {}
+
+    def _flatten(node, prefix: str):
+        if tensorstore_leaf(None, node):
+            out[prefix] = node
+            return
+        if isinstance(node, dict):
+            if len(node) == 0 and keep_empty_nodes:
+                out[prefix] = {}
+                return
+            for k, v in node.items():
+                key = f"{prefix}/{k}" if prefix else str(k)
+                _flatten(v, key)
+            return
+        out[prefix] = node
+
+    _flatten(state_dict, "")
+    if "" in out:
+        out = {"root": out[""]}
+    return out
 
 
 def print_params(params):
     """Print all parameters in the model."""
     params_flatten = flatten_state_dict(params)
 
+    if not params_flatten:
+        log_for_0("No parameters found.")
+        return
+
+    def _shape_of(param):
+        if hasattr(param, "shape"):
+            return tuple(param.shape)
+        return ()
+
+    def _numel_of(param):
+        if torch.is_tensor(param):
+            return int(param.numel())
+        if isinstance(param, np.ndarray):
+            return int(param.size)
+        if hasattr(param, "size") and isinstance(param.size, int):
+            return int(param.size)
+        shape = _shape_of(param)
+        if len(shape) == 0:
+            return 1
+        return int(np.prod(shape))
+
     total_params = 0
     max_length = max(len(k) for k in params_flatten.keys())
-    max_shape = max(len(f"{p.shape}") for p in params_flatten.values())
-    max_digits = max(len(f"{p.size:,}") for p in params_flatten.values())
+    max_shape = max(len(f"{_shape_of(p)}") for p in params_flatten.values())
+    max_digits = max(len(f"{_numel_of(p):,}") for p in params_flatten.values())
     log_for_0("-" * (max_length + max_digits + max_shape + 8))
 
     for name, param in params_flatten.items():
-        layer_params = param.size
-        str_layer_shape = f"{param.shape}".rjust(max_shape)
+        layer_params = _numel_of(param)
+        str_layer_shape = f"{_shape_of(param)}".rjust(max_shape)
         str_layer_params = f"{layer_params:,}".rjust(max_digits)
         log_for_0(
             f" {name.ljust(max_length)} | {str_layer_shape} | {str_layer_params} "

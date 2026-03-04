@@ -1,92 +1,150 @@
-"""Default Hyperparameter configuration."""
-
-import ml_collections
+"""Default hyperparameter configuration for pure PyTorch pMF."""
 
 
 def get_config():
-    """Get the default hyperparameter configuration."""
-    config = ml_collections.ConfigDict()
-
-    # ------------------------------------------------------------
-    # Dataset
-    config.dataset = dataset = ml_collections.ConfigDict()
-
-    dataset.root = ""
-
-    dataset.num_workers = 8
-    dataset.prefetch_factor = 4
-    dataset.pin_memory = False
-
-    dataset.image_size = 256
-    dataset.image_channels = 3
-    dataset.num_classes = 1000
-    dataset.use_flip = False
-
-    # ------------------------------------------------------------
-    # Training
-    config.training = training = ml_collections.ConfigDict()
-
-    training.learning_rate = 0.0001
-    training.batch_size = 256
-
-    training.num_epochs = 1000
-
-    training.log_per_step = 100
-    training.sample_per_epoch = 10
-    training.checkpoint_per_epoch = 10
-    training.fid_per_epoch = 10
-    training.half_precision = False
-
-    training.seed = 42
-
-    training.adam_b2 = 0.95
-    training.ema_val = [0.9999]
-
-    training.lr_schedule = "warmup_const"
-    training.warmup_epochs = 0
-
-    # ------------------------------------------------------------
-    # MeanFlow
-    config.model = model = ml_collections.ConfigDict()
-    model.num_classes = dataset.num_classes
-
-    # Noise Distribution
-    model.P_mean = -0.4
-    model.P_std = 1.0
-
-    # Loss
-    model.data_proportion = 0.5
-    model.cfg_beta = 1.0
-    model.cfg_max = 7.0
-    model.class_dropout_prob = 0.1
-
-    # Training Dynamics
-    model.norm_p = 1.0
-    model.norm_eps = 0.01
-
-    # ------------------------------------------------------------
-    # Sampling
-    config.sampling = sampling = ml_collections.ConfigDict()
-    sampling.num_steps = 1
-    sampling.num_classes = dataset.num_classes
-
-    # ------------------------------------------------------------
-    # FID
-    config.fid = fid = ml_collections.ConfigDict()
-    fid.num_samples = 50000
-    fid.device_batch_size = 40
-    fid.cache_ref = ""
-
-    # ------------------------------------------------------------
-    # Logging
-    config.logging = logging = ml_collections.ConfigDict()
-    logging.wandb_project = ""
-    logging.wandb_entity = ""
-    logging.wandb_notes = ""
-    logging.wandb_tags = []
-
-    # others
-    config.load_from = ""
-    config.eval_only = False
-
-    return config
+    return {
+        "dataset": {
+            "root": "",
+            "val_labels_file": "",  # for flat val/*.JPEG layout; supports filename+label or one-label-per-line txt
+            "num_workers": 8,
+            "prefetch_factor": 4,
+            "pin_memory": True,
+            "image_size": 256,
+            "image_channels": 3,
+            "num_classes": 1000,
+            "use_flip": False,
+        },
+        "training": {
+            "optimizer": "muon",
+            "learning_rate": 1e-4,
+            "batch_size": 256,
+            "enable_distributed": True,
+            "num_epochs": 1000,
+            "log_per_step": 100,
+            "sample_per_epoch": 10,
+            "checkpoint_per_epoch": 10,
+            "half_precision": True,
+            "seed": 42,
+            "adam_b2": 0.95,
+            "adam_b1": 0.9,
+            "adam_eps": 1e-8,
+            "adam_weight_decay": 0.0,
+            "adam_learning_rate": None,
+            "ema_type": "const",
+            "ema_val": [0.9999],
+            "lr_schedule": "warmup_const",
+            "warmup_epochs": 0,
+            "weight_decay": 0.0,
+            "muon_momentum": 0.95,
+            "muon_nesterov": True,
+            "muon_beta1": 0.9,
+            "muon_eps": 1e-8,
+            "muon_ns_steps": 5,
+            "muon_ns_eps": 1e-7,
+        },
+        "model": {
+            "model_str": "pmfDiT_B_16",
+            "num_classes": 1000,
+            "clip_feature_dim": 1024,
+            "dino_feature_dim": 768,
+            "num_clip_tokens": 4,
+            "num_dino_tokens": 4,
+            "P_mean": -0.4,
+            "P_std": 1.0,
+            "data_proportion": 0.5,
+            "cfg_beta": 1.0,
+            "cfg_max": 7.0,
+            "class_dropout_prob": 0.1,
+            "cond_drop_high_noise_only": True,
+            "schedule_t0": 0.5,
+            "lambda_perc_max": 1.0,
+            "lambda_perc_gamma": 4.0,
+            "lambda_perc_hard_t0": True,
+            "lambda_sem_max": 1.0,
+            "lambda_sem_beta": 2.0,
+            "lambda_sem_eps": 1e-4,
+            "lambda_sem_gate": "sigmoid",
+            "lambda_sem_gate_k": 12.0,
+            "lambda_sem_hard_t0": True,
+            "enable_semantic_loss": True,
+            "attention_impl": "qwen_gated",  # one of: standard, qwen_gated
+            "attention_gate_bias_init": 4.0,
+            "norm_p": 1.0,
+            "norm_eps": 0.01,
+            "noise_scale": 1.0,
+            "lpips": False,
+            "lpips_lambda": 1.0,
+            "convnext": False,
+            "convnext_model_name": "/root/autodl-tmp/hf_models/convnextv2-base-22k-224",
+            "convnext_lambda": 0.0,
+            "perceptual_max_t": 1.0,
+            "tr_uniform": False,
+            "eval": False,
+        },
+        "sampling": {
+            "num_steps": 1,
+            "omega": 7.0,
+            "t_min": 0.1,
+            "t_max": 0.7,
+            "num_classes": 1000,
+        },
+        "condition": {
+            "enable_semantic": False,
+            "mode": "uncond",  # one of: uncond, clip, dino, clip_dino
+            "clip_model_name": "openai/clip-vit-large-patch14",
+            "dino_model_name": "facebook/dinov2-base",
+            "dino_use_dense": True,
+            "device": "cuda",
+            "semantic_cache_root": "",
+            "semantic_cache_strict": True,
+        },
+        "fid": {
+            "num_samples": 50000,
+            "device_batch_size": 40,
+            "cache_ref": "",
+        },
+        "evaluation": {
+            "enable": False,
+            "every_n_epochs": 10,
+            "max_samples": 1000,
+            "batch_size": 32,
+            "seed": 2026,
+            "low_t": 0.2,
+            "low_rho": 0.25,
+            "high_t": 0.9,
+            "high_rho": 0.9,
+            "probe_t_values": [0.25, 0.65, 0.9],
+            "probe_rho_values": [0.0, 0.25, 0.65, 0.9],
+            "probe_pairs_per_t": 8,
+            "probe_rho_zero_ratio": 0.25,
+            "probe_nonzero_rho_values": [0.25, 0.65, 0.9],
+            "cfg_w_mid": 4.0,
+            "cfg_w_high": 8.0,
+            "interval_on": [0.5, 1.0],
+            "interval_off": [0.0, 0.5],
+            "num_vis": 4,
+            "compute_fid": True,
+            "compute_is": True,
+            "preflight_check": False,
+            "preflight_max_samples": 32,
+            "preflight_include_fid_is": False,
+            "preflight_fid_num_images": 0,
+            "preflight_fid_device_batch_size": 0,
+            "lpips_resize": 224,
+            "best_lpips_psnr_tradeoff": 10.0,
+            "best_top_k": 3,
+            "freq_hf_cutoff": 0.5,
+            "freq_angle_bins": 16,
+            "freq_radial_bins": 24,
+        },
+        "logging": {
+            "use_tensorboard": True,
+            "use_wandb": False,
+            "wandb_project": "",
+            "wandb_entity": "",
+            "wandb_notes": "",
+            "wandb_tags": [],
+        },
+        "load_from": "",
+        "eval_only": False,
+    }

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="1e080ccd-6663-47d5-acd2-84cb6275ffbf" name="pmf">
+        <fileTransfer rootFolder="/root" accessType="SFTP" host="connect.westc.gpuhub.com" port="40506" sshConfigId="39f3f140-06a9-4458-81f2-2a97a631a5e2" sshConfig="root@connect.westc.gpuhub.com:40506 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

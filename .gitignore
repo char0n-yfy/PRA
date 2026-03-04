@@ -6,3 +6,6 @@ tmp/
 config.sh
 
 .DS_Store
+/output/
+/杂项/
+/pmf/

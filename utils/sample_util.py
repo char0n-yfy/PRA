@@ -1,118 +1,104 @@
-import jax
-from jax import random
-import jax.numpy as jnp
+import math
+
 import numpy as np
+import torch
+
 from utils import fid_util
-from utils.logging_util import log_for_0
+from utils.logging_util import get_rank, get_world_size, log_for_0
 
 
-def run_p_sample_step(
-        p_sample_step, state, sample_idx, ema: float = None, **kwargs
-):
+def run_p_sample_step(p_sample_step, state, sample_idx, ema: float = None, **kwargs):
     """
-    Run one p_sample_step to get samples from the model.
+    Run one sampling step and return uint8 BHWC numpy images.
     """
-    params = state.ema_params[ema] if ema is not None else state.params
+    samples = p_sample_step(state=state, sample_idx=sample_idx, ema=ema, **kwargs)
+    if torch.is_tensor(samples):
+        samples = samples.detach().cpu().numpy()
+    samples = np.asarray(samples)
 
-    variable = {"params": params}
-    samples = p_sample_step(variable, sample_idx=sample_idx, **kwargs)
-    samples = samples.reshape(-1, *samples.shape[2:])
+    if samples.ndim != 4:
+        raise ValueError(f"Expected rank-4 samples, got shape {samples.shape}")
+    if samples.shape[1] in (1, 3):  # BCHW
+        samples = np.transpose(samples, (0, 2, 3, 1))
 
-    assert not jnp.any(
-        jnp.isnan(samples)
-    ), f"There is nan in samples!"
-
-    samples = samples.transpose(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
-    samples = 127.5 * samples + 128.0
-    samples = jnp.clip(samples, 0, 255).astype(jnp.uint8)
-
-    jax.random.normal(random.key(0), ()).block_until_ready()  # dist sync
+    if samples.dtype != np.uint8:
+        samples = np.clip(127.5 * samples + 128.0, 0, 255).astype(np.uint8)
     return samples
 
 
-def generate_fid_samples(
-    state, config, p_sample_step, run_p_sample_step, ema: float = None, **kwargs
-):
+def generate_fid_samples(state, config, p_sample_step, run_p_sample_step_fn, ema: float = None, **kwargs):
     """
     Generate samples for FID evaluation.
     """
-    num_steps = np.ceil(
-        config.fid.num_samples / config.fid.device_batch_size / jax.device_count()
-    ).astype(int)
+    world_size = max(1, get_world_size())
+    per_rank = int(math.ceil(config.fid.num_samples / world_size))
+    num_steps = int(math.ceil(per_rank / config.fid.device_batch_size))
 
     samples_all = []
-
-    log_for_0("Note: the first sample may be significant slower")
+    log_for_0("Note: the first sample may be slower due to model warmup.")
     for step in range(num_steps):
-        sample_idx = jax.process_index() * jax.local_device_count() + jnp.arange(
-            jax.local_device_count()
+        begin = step * config.fid.device_batch_size
+        end = min(per_rank, begin + config.fid.device_batch_size)
+        sample_idx = np.arange(begin, end, dtype=np.int64) + get_rank() * per_rank
+        log_for_0(f"Sampling step {step + 1}/{num_steps}...")
+        samples = run_p_sample_step_fn(
+            p_sample_step,
+            state,
+            sample_idx=sample_idx,
+            ema=ema,
+            **kwargs,
         )
-        sample_idx = jax.device_count() * step + sample_idx
-        log_for_0(f"Sampling step {step} / {num_steps}...")
-        samples = run_p_sample_step(
-            p_sample_step, state, sample_idx=sample_idx, ema=ema, **kwargs
-        )
-        samples = jax.device_get(samples)
         samples_all.append(samples)
 
     samples_all = np.concatenate(samples_all, axis=0)
-
-    return samples_all
+    return samples_all[:per_rank]
 
 
 def get_fid_evaluator(config, writer):
     """
     Create FID evaluator function.
     """
-    inception_net = fid_util.build_jax_inception()
+    inception_net = fid_util.build_jax_inception(batch_size=config.fid.device_batch_size)
     stats_ref = fid_util.get_reference(config.fid.cache_ref)
-    run_p_sample_step_inner = run_p_sample_step
 
     def _evaluate_one_mode(state, p_sample_step, ema: float = None, **kwargs):
-        # 1) Sampling
         samples_all = generate_fid_samples(
-            state, config, p_sample_step, run_p_sample_step_inner, ema, **kwargs
+            state,
+            config,
+            p_sample_step,
+            run_p_sample_step,
+            ema=ema,
+            **kwargs,
         )
-        # 2) Stats
         stats = fid_util.compute_stats(samples_all, inception_net)
-        # 3) Metrics
         metric = {}
 
         mode_str = f"ema_{ema}" if ema is not None else "online"
-
-        omega = kwargs.get("omega", None)[0]
-        t_min = kwargs.get("t_min", None)[0]
-        t_max = kwargs.get("t_max", None)[0]
-        log_for_0(
-            f"Computing FID and Inception Score at omega={omega:.2f}, t_min={t_min:.2f}, t_max={t_max:.2f}, mode={mode_str}..."
-        )
+        omega = float(np.asarray(kwargs.get("omega", 0.0)).reshape(-1)[0])
+        t_min = float(np.asarray(kwargs.get("t_min", 0.0)).reshape(-1)[0])
+        t_max = float(np.asarray(kwargs.get("t_max", 1.0)).reshape(-1)[0])
         descriptor = f"omega_{omega:.2f}_tmin_{t_min:.2f}_tmax_{t_max:.2f}_{mode_str}"
 
-        fid = fid_util.compute_fid(
-            stats_ref["mu"], stats["mu"], stats_ref["sigma"], stats["sigma"]
-        )
+        fid = fid_util.compute_fid(stats_ref["mu"], stats["mu"], stats_ref["sigma"], stats["sigma"])
         is_score, _ = fid_util.compute_inception_score(stats["logits"])
 
         metric[f"FID_{descriptor}"] = fid
         metric[f"IS_{descriptor}"] = is_score
-
         log_for_0(f"FID ({descriptor}): {fid:.4f}, IS ({descriptor}): {is_score:.4f}")
-
         return metric, fid, is_score
 
     def evaluator(state, p_sample_step, step, ema_only=False, **kwargs):
         metric_dict = {}
+        fid, is_score = None, None
         ema = kwargs.pop("ema", None)
-        if hasattr(ema, "item"):
-            ema = ema[0].item()
-        ema_list = [ema] if ema is not None else state.ema_params.keys()
-        for ema in ema_list:
-            metric, fid, is_score = _evaluate_one_mode(
-                state, p_sample_step, ema=ema, **kwargs
-            )
+        ema_list = [ema] if ema is not None else list(getattr(state, "ema_params", {}).keys())
+
+        for ema_item in ema_list:
+            metric, fid, is_score = _evaluate_one_mode(state, p_sample_step, ema=ema_item, **kwargs)
             metric_dict.update(metric)
+
         if not ema_only:
-            metric, _, _ = _evaluate_one_mode(state, p_sample_step, ema=None, **kwargs)
+            metric, fid, is_score = _evaluate_one_mode(state, p_sample_step, ema=None, **kwargs)
             metric_dict.update(metric)
 
         writer.write_scalars(step + 1, metric_dict)

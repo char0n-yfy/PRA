@@ -1,49 +1,50 @@
-import logging as _logging
-import time, os
+import logging
+import os
 import shutil
-
-import jax
-from absl import logging
+import time
+from typing import Dict
 
 import numpy as np
 from PIL import Image
-import wandb
+import torch
+
+try:
+    import wandb
+except Exception:
+    wandb = None
 
 
-def log_for_0(*args):
-    if jax.process_index() == 0:
-        logging.info(*args, stacklevel=2)
+def is_distributed():
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
 
 
-class ExcludeInfo(_logging.Filter):
-    def __init__(self, exclude_files):
-        super().__init__()
-        self.exclude_files = exclude_files
-
-    def filter(self, record):
-        if any(file_name in record.pathname for file_name in self.exclude_files):
-            return record.levelno > _logging.INFO
-        return True
+def get_rank():
+    if is_distributed():
+        return torch.distributed.get_rank()
+    # torchrun sets RANK before torch.distributed.init_process_group(); use it to
+    # avoid duplicate "rank0-only" logs during early startup.
+    return int(os.environ.get("RANK", "0"))
 
 
-exclude_files = [
-    "orbax/checkpoint/async_checkpointer.py",
-    "orbax/checkpoint/abstract_checkpointer.py",
-    "orbax/checkpoint/multihost/utils.py",
-    "orbax/checkpoint/future.py",
-    "orbax/checkpoint/_src/handlers/base_pytree_checkpoint_handler.py",
-    "orbax/checkpoint/type_handlers.py",
-    "orbax/checkpoint/metadata/checkpoint.py",
-    "orbax/checkpoint/metadata/sharding.py",
-] + [
-    "orbax/checkpoint/checkpointer.py",
-    "flax/training/checkpoints.py",
-] * jax.process_index()
-file_filter = ExcludeInfo(exclude_files)
+def get_world_size():
+    return torch.distributed.get_world_size() if is_distributed() else 1
+
+
+def barrier():
+    if is_distributed():
+        torch.distributed.barrier()
+
+
+def log_for_0(msg, *args):
+    if get_rank() == 0:
+        if args:
+            logging.info(msg, *args)
+        else:
+            logging.info(msg)
 
 
 def supress_checkpt_info():
-    logging.get_absl_handler().addFilter(file_filter)
+    pass
 
 
 class Timer:
@@ -54,7 +55,6 @@ class Timer:
         return time.time() - self.start_time
 
     def elapse_with_reset(self):
-        """This do both elaspse and reset"""
         a = time.time() - self.start_time
         self.reset()
         return a
@@ -68,118 +68,146 @@ class Timer:
 
 class MetricsTracker:
     def __init__(self):
-        self._sum = None  # tree of numpy arrays (host)
-        self._n = 0  # number of steps accumulated on *this host*
+        self._sum = {}
+        self._n = 0
 
-    @staticmethod
-    def _mean_over_local_devices(x):
-        """
-        Bring one leaf to host and average over local device axis if present.
-        This avoids keeping per-device values around on host.
-        """
-        # device_get blocks on the computation that produced x.
-        a = np.asarray(jax.device_get(x))
-        # Under pmap, metrics often have shape [local_devices, ...].
-        # If it's already scalar (0-D), leave unchanged.
-        if a.ndim >= 1:  # treat leading axis as local device axis
-            a = a.mean(axis=0)
-        return a
-
-    def update(self, metrics_step_tree):
-        """
-        Incorporate one step's metrics (per-replica JAX arrays) into the running sum.
-        Call this once per training step.
-        """
-        local_mean = jax.tree_map(self._mean_over_local_devices, metrics_step_tree)
-        if self._sum is None:
-            self._sum = local_mean
-        else:
-            self._sum = jax.tree_map(lambda s, x: s + x, self._sum, local_mean)
+    def update(self, metrics: Dict[str, torch.Tensor]):
+        for k, v in metrics.items():
+            if torch.is_tensor(v):
+                val = float(v.detach().mean().item())
+            else:
+                val = float(v)
+            self._sum[k] = self._sum.get(k, 0.0) + val
         self._n += 1
 
     def finalize(self):
-        """
-        Return global mean over steps, devices, and hosts as a tree of Python floats.
-        Resets internal state. Safe to call at any logging boundary.
-        """
         if self._n == 0:
             return {}
-
-        out = jax.tree_map(
-            lambda s: float(np.asarray(s / self._n, dtype=np.float64).mean()),
-            self._sum,
-        )
-
-        self._sum, self._n = None, 0
+        out = {k: v / self._n for k, v in self._sum.items()}
+        self._sum, self._n = {}, 0
         return out
 
 
 class Writer:
     def __init__(self, config, workdir):
-        if jax.process_index() != 0:
-            return
         self.workdir = workdir
-        kwargs = {}
-
-        self.use_wandb = config.logging.use_wandb
-
-        if self.use_wandb:
+        self.use_wandb = bool(getattr(config.logging, "use_wandb", False))
+        self.use_tensorboard = bool(getattr(config.logging, "use_tensorboard", True))
+        self.tb_writer = None
+        if get_rank() != 0:
+            return
+        if self.use_tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except Exception:
+                SummaryWriter = None
+            if SummaryWriter is not None:
+                tb_dir = os.path.join(workdir, "tensorboard")
+                os.makedirs(tb_dir, exist_ok=True)
+                self.tb_writer = SummaryWriter(log_dir=tb_dir)
+                log_for_0(f"TensorBoard logging enabled at: {tb_dir}")
+            else:
+                log_for_0("TensorBoard is unavailable; install `tensorboard` to enable it.")
+        else:
+            log_for_0("TensorBoard logging is disabled by config.logging.use_tensorboard=False.")
+        if self.use_wandb and wandb is not None:
             wandb.init(
                 project=config.logging.wandb_project,
                 entity=config.logging.wandb_entity if config.logging.wandb_entity else None,
                 notes=config.logging.wandb_notes if config.logging.wandb_notes else None,
                 tags=config.logging.wandb_tags if config.logging.wandb_tags else None,
-                dir="/tmp",  # avoid writing to workdir
-                settings=wandb.Settings(_service_wait=60),
-                **kwargs,
+                dir="/tmp",
             )
-            wandb.config.update(config.to_dict(), allow_val_change=True)
+            if hasattr(config, "to_dict"):
+                wandb.config.update(config.to_dict(), allow_val_change=True)
         else:
-            log_for_0("Wandb logging is disabled. Images will be saved to disk.")
+            self.use_wandb = False
+            log_for_0("Wandb logging is disabled.")
 
     def write_scalars(self, step, scalar_dict):
-        if jax.process_index() != 0:
+        if get_rank() != 0:
             return
-        log_str = f"[{step}]"
-        for k, v in scalar_dict.items():
-            log_str += f" {k}={v:.5g}," if isinstance(v, float) else f" {k}={v},"
-        log_str = log_str.strip(",")
+        log_str = f"[{step}] " + ", ".join(
+            [f"{k}={v:.5g}" if isinstance(v, float) else f"{k}={v}" for k, v in scalar_dict.items()]
+        )
         logging.info(log_str)
+        if self.tb_writer is not None:
+            for k, v in scalar_dict.items():
+                if torch.is_tensor(v):
+                    v = float(v.detach().mean().item())
+                else:
+                    v = float(v)
+                self.tb_writer.add_scalar(self._tensorboard_tag(k), v, step)
+            self.tb_writer.flush()
         if self.use_wandb:
             wandb.log(scalar_dict, step=step)
 
+    @staticmethod
+    def _tensorboard_tag(key: str) -> str:
+        # Keep pre-grouped tags (e.g. eval/...).
+        if "/" in key:
+            return key
+
+        if key in {
+            "loss",
+            "loss_u",
+            "loss_v",
+            "loss_perc",
+            "loss_sem",
+            "loss_sem_raw",
+        }:
+            return f"train/loss/{key}"
+        if key.startswith("aux_loss_"):
+            return f"train/aux/{key}"
+        if key.startswith("lambda_"):
+            return f"train/weights/{key}"
+        if key in {"high_noise_ratio", "cond_drop_ratio", "h_over_t"}:
+            return f"train/sampling/{key}"
+        if key == "lr":
+            return "train/optim/lr"
+        if key in {"steps_per_second", "epoch"}:
+            return f"train/system/{key}"
+        return f"train/misc/{key}"
+
     def write_images(self, step, image_dict):
-        if jax.process_index() != 0:
+        if get_rank() != 0:
             return
 
-        def reduce_arr_func(v):
+        def to_numpy_hwc(v):
             if isinstance(v, Image.Image):
-                return v
-            assert isinstance(v, np.ndarray), "Invalid image type {}".format(type(v))
-            assert v.dtype == np.uint8, "Invalid image dtype {}".format(v.dtype)
-            assert v.ndim == 3 and 3 in [
-                v.shape[0],
-                v.shape[2],
-            ], "Invalid image shape {}".format(v.shape)
-            if v.shape[0] == 3:
-                v = v.transpose((1, 2, 0))
-            return Image.fromarray(v)
+                return np.asarray(v)
+            if torch.is_tensor(v):
+                v = v.detach().cpu().numpy()
+            assert isinstance(v, np.ndarray)
+            if v.ndim == 3 and v.shape[0] in (1, 3):
+                v = np.transpose(v, (1, 2, 0))
+            if v.dtype != np.uint8:
+                v = np.clip(v, 0, 255).astype(np.uint8)
+            return v
 
-        if self.use_wandb:    
-            wandb.log(
-                {k: wandb.Image(reduce_arr_func(v)) for k, v in image_dict.items()},
-                step=step,
-            )
+        np_images = {k: to_numpy_hwc(v) for k, v in image_dict.items()}
+        if self.tb_writer is not None:
+            for k, v in np_images.items():
+                self.tb_writer.add_image(k, v, step, dataformats="HWC")
+            self.tb_writer.flush()
+        if self.use_wandb:
+            wandb.log({k: wandb.Image(Image.fromarray(v)) for k, v in np_images.items()}, step=step)
         else:
-            if not os.path.exists(f"{self.workdir}/images/"):
-                os.makedirs(f"{self.workdir}/images/")
-            for k, v in image_dict.items():
-                img = reduce_arr_func(v)
-                img.save(f"{self.workdir}/images/{step}_{k}.png")
+            out_dir = os.path.join(self.workdir, "images")
+            os.makedirs(out_dir, exist_ok=True)
+            for k, v in np_images.items():
+                Image.fromarray(v).save(os.path.join(out_dir, f"{step}_{k}.png"))
 
     def __del__(self):
-        if jax.process_index() != 0:
+        # Interpreter shutdown can tear down imported modules (e.g., torch)
+        # before object finalizers run, so make cleanup best-effort only.
+        try:
+            if get_rank() != 0:
+                return
+            if self.tb_writer is not None:
+                self.tb_writer.close()
+            if self.use_wandb and wandb is not None:
+                wandb.finish()
+                shutil.rmtree("/tmp/wandb", ignore_errors=True)
+        except Exception:
             return
-        if self.use_wandb:
-            wandb.finish()
-            shutil.rmtree("/tmp/wandb", ignore_errors=True)

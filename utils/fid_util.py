@@ -1,413 +1,199 @@
 import os
-import time
+from dataclasses import dataclass
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import torch
-from jax.experimental import multihost_utils
-from tqdm import tqdm
-from absl import logging
+import torch.nn.functional as F
+from torchvision.models import Inception_V3_Weights, inception_v3
 
-from .jax_fid import inception, resize
-from .logging_util import log_for_0
+from utils.data_util import create_imagenet_dataloader
+from utils.logging_util import log_for_0
+
+
+def _softmax(logits: np.ndarray, axis: int = -1):
+    logits = logits - np.max(logits, axis=axis, keepdims=True)
+    exp = np.exp(logits)
+    return exp / np.sum(exp, axis=axis, keepdims=True)
+
+
+def _to_uint8_bhwc(x):
+    if torch.is_tensor(x):
+        t = x.detach().cpu()
+        if t.ndim != 4:
+            raise ValueError(f"Expected rank-4 image tensor, got shape {tuple(t.shape)}")
+        if t.shape[-1] == 3:
+            if t.dtype != torch.uint8:
+                t = torch.clamp(t, 0, 255).to(torch.uint8)
+            return t.numpy()
+        if t.shape[1] == 3:
+            if t.dtype == torch.uint8:
+                t = t.permute(0, 2, 3, 1)
+            else:
+                if t.min() < 0:
+                    t = ((t + 1.0) * 127.5).clamp(0, 255)
+                else:
+                    t = (t * 255.0).clamp(0, 255)
+                t = t.to(torch.uint8).permute(0, 2, 3, 1)
+            return t.numpy()
+        raise ValueError(f"Cannot infer image layout from tensor shape {tuple(t.shape)}")
+
+    arr = np.asarray(x)
+    if arr.ndim != 4:
+        raise ValueError(f"Expected rank-4 image array, got shape {arr.shape}")
+    if arr.shape[-1] != 3:
+        raise ValueError(f"Expected BHWC images, got shape {arr.shape}")
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
+@dataclass
+class TorchInception:
+    batch_size: int = 200
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def __post_init__(self):
+        self.model = inception_v3(
+            weights=Inception_V3_Weights.IMAGENET1K_V1,
+            aux_logits=False,
+            transform_input=False,
+        ).to(self.device)
+        self.model.eval()
+        self._pool = None
+
+        def _hook(_, __, output):
+            self._pool = output
+
+        self._handle = self.model.avgpool.register_forward_hook(_hook)
+        self.mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+
+    @torch.no_grad()
+    def __call__(self, images_bhwc_uint8: np.ndarray):
+        x = torch.from_numpy(images_bhwc_uint8).to(device=self.device, dtype=torch.float32)
+        x = x.permute(0, 3, 1, 2) / 255.0
+        x = F.interpolate(x, size=(299, 299), mode="bilinear", align_corners=False, antialias=True)
+        x = (x - self.mean) / self.std
+        self._pool = None
+        logits = self.model(x)
+        if self._pool is None:
+            raise RuntimeError("Inception avgpool hook did not run.")
+        feats = self._pool.flatten(1)
+        return feats.cpu().numpy(), logits.cpu().numpy()
 
 
 def compute_fid(mu1, mu2, sigma1, sigma2, eps=1e-6):
-    mu1 = np.atleast_1d(mu1).astype(np.float64)
-    mu2 = np.atleast_1d(mu2).astype(np.float64)
-    sigma1 = np.atleast_1d(sigma1).astype(np.float64)
-    sigma2 = np.atleast_1d(sigma2).astype(np.float64)
-
-    assert mu1.shape == mu2.shape
-    assert sigma1.shape == sigma2.shape
+    mu1 = np.asarray(mu1, dtype=np.float64)
+    mu2 = np.asarray(mu2, dtype=np.float64)
+    sigma1 = np.asarray(sigma1, dtype=np.float64)
+    sigma2 = np.asarray(sigma2, dtype=np.float64)
 
     diff = mu1 - mu2
-    tr_covmean = np.sum(
-        np.sqrt(np.linalg.eigvals(sigma1.dot(sigma2)).astype("complex128")).real
-    )
-    fid = float(diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
-    return fid
+    cov_prod = sigma1 @ sigma2
+    cov_prod = (cov_prod + cov_prod.T) * 0.5
+
+    try:
+        from scipy import linalg
+
+        covmean = linalg.sqrtm(cov_prod)
+        if not np.isfinite(covmean).all():
+            covmean = linalg.sqrtm((sigma1 + eps * np.eye(sigma1.shape[0])) @ (sigma2 + eps * np.eye(sigma2.shape[0])))
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+    except Exception:
+        vals, vecs = np.linalg.eigh(cov_prod)
+        vals = np.clip(vals, a_min=0.0, a_max=None)
+        covmean = (vecs * np.sqrt(vals)[None, :]) @ vecs.T
+
+    fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2.0 * covmean)
+    return float(np.real(fid))
 
 
 def build_jax_inception(batch_size=200):
-    """
-    Build InceptionV3 model that always returns all features.
-
-    Args:
-        batch_size: Batch size for compilation
-
-    Returns:
-        Dictionary with model parameters and compiled function
-    """
-    logging.info("Initializing Extended InceptionV3")
-    model = inception.InceptionV3(
-        pretrained=True,
-        include_head=True,  # Need head for logits
-        transform_input=False,  # Already normalized in resize.forward
-    )
-
-    # Initialize with dummy input
-    dummy_input = jnp.ones((1, 299, 299, 3))
-    rng = jax.random.PRNGKey(0)
-    inception_params = model.init(rng, dummy_input, train=False)
-
-    logging.info("Initialized Extended InceptionV3")
-
-    # Create a single function that always returns all features
-    def inception_apply(params, x):
-        return model.apply(params, x, train=False)
-
-    # JIT compile the function
-    inception_fn = jax.jit(inception_apply)
-
-    # Compile for the expected batch size
-    fake_x = jnp.zeros((batch_size, 299, 299, 3), dtype=jnp.float32)
-    logging.info("Start compiling inception function...")
-    t_start = time.time()
-
-    # Trigger compilation
-    _ = inception_fn(inception_params, fake_x)
-
-    logging.info(f"End compiling: {(time.time() - t_start):.4f} seconds.")
-
-    inception_net = {"params": inception_params, "fn": inception_fn, "model": model}
-    return inception_net
+    # Kept for backward compatibility with existing call sites.
+    return TorchInception(batch_size=batch_size)
 
 
 def get_reference(cache_path):
-    # Load ref_mu and ref_sigma from npz file
-    assert os.path.exists(cache_path), f"Cache file must exist: {cache_path}"
-
-    log_for_0(f"Loading ref_mu and ref_sigma from {cache_path}")
-    if jax.process_index() == 0:
-        os.system("md5sum " + cache_path)
-
-    ref = {}
-
-    with np.load(cache_path) as data:
-        if "ref_mu" in data:
-            ref_mu, ref_sigma = data["ref_mu"], data["ref_sigma"]
-        else:
-            raise NotImplementedError
-
-    ref = {"mu": ref_mu, "sigma": ref_sigma}
-    return ref
+    if not cache_path or not os.path.exists(cache_path):
+        raise FileNotFoundError(f"FID reference stats not found: {cache_path}")
+    return dict(np.load(cache_path))
 
 
-LDC = jax.local_device_count()
+def compute_stats(samples_all, inception_net):
+    images = _to_uint8_bhwc(samples_all)
+    feats_all = []
+    logits_all = []
+    bsz = int(getattr(inception_net, "batch_size", 200))
 
+    for i in range(0, images.shape[0], bsz):
+        feats, logits = inception_net(images[i : i + bsz])
+        feats_all.append(feats)
+        logits_all.append(logits)
 
-def revert_pmap_shape(x):
-    return x.reshape((-1, *x.shape[2:]))
-
-def _preprocess_per_device(x_u8_nhwc):
-    x = x_u8_nhwc.astype(jnp.float32)
-    x = resize.resize_torch_grid_sample(x, 299, 299)
-    x = (x - 128.0) / 128.0
-    return x
-
-_preprocess_u8_to_inception_input_pmap = jax.pmap(
-    _preprocess_per_device,
-    axis_name="d",
-)
-
-def compute_stats(
-    samples,
-    inception_net,
-    batch_size=200,
-    fid_samples=50000,
-):
-    inception_fn = inception_net["fn"]
-    inception_params = inception_net["params"]
-
-    num_samples = len(samples)
-    full_batch_size = batch_size * LDC
-    pad = int(np.ceil(num_samples / full_batch_size)) * full_batch_size - num_samples
-    samples = np.concatenate(
-        [samples, np.zeros((pad, *samples.shape[1:]), dtype=np.uint8)]
-    )
-    assert len(samples) % full_batch_size == 0
-
-    l_feats = []
-    l_logits = []
-
-    preprocess_total = 0.0
-    inception_total = 0.0
-
-    for i in range(0, len(samples), full_batch_size):
-        x = samples[i : i + full_batch_size]  # uint8 NHWC on host
-        log_for_0(f"Evaluating {i} / {num_samples}: {list(x.shape)}")
-        per_dev = full_batch_size // LDC
-        x_sharded = x.reshape((LDC, per_dev) + x.shape[1:])  # host array
-
-        # device_put once; pmap will keep it sharded
-        x_dev = jax.device_put(x_sharded)
-
-        # ---- Time preprocess (pmap) ----
-        t0 = time.perf_counter()
-        x_in = _preprocess_u8_to_inception_input_pmap(x_dev)  # [LDC, per_dev, 299, 299, C]
-        # Ensure timing includes execution
-        x_in = x_in.reshape((-1,) + x_in.shape[2:])
-        jax.block_until_ready(x_in)
-        t1 = time.perf_counter()
-        preprocess_total += (t1 - t0)
-
-        # ---- Time inception (already pmapped) ----
-        t2 = time.perf_counter()
-        pooled_features, spatial_features, logits = inception_fn(
-            inception_params, jax.lax.stop_gradient(x_in)
-        )
-        # Ensure timing includes execution; pool/logits are device arrays
-        jax.block_until_ready(pooled_features)
-        jax.block_until_ready(logits)
-        t3 = time.perf_counter()
-        inception_total += (t3 - t2)
-
-        # Flatten sharded outputs to [B, ...] for later concat
-        pooled_flat = pooled_features.reshape((-1, pooled_features.shape[-1]))
-        logits_flat = logits.reshape((-1, logits.shape[-1]))
-
-        l_feats.append(pooled_flat)
-        l_logits.append(logits_flat)
-
-    # Process pooled features
-    np_feats = jnp.concatenate(l_feats)
-    np_feats = np_feats[:num_samples]
-    np_feats = np_feats.reshape((-1, LDC, np_feats.shape[-1]))
-    np_feats = np_feats.transpose((1, 0, 2))  # (LDC, N//LDC, feat_dim)
-
-    all_feats = multihost_utils.process_allgather(np_feats)
-    all_feats = all_feats.reshape((-1, ) + all_feats.shape[2:])
-    all_feats = all_feats.transpose((1, 0, 2))  # (N//LDC, num_hosts*LDC, feat_dim)
-    all_feats = all_feats.reshape(-1, all_feats.shape[-1])
-    all_feats = jax.device_get(all_feats)
-
-    log_for_0(
-        f"FID final samples: {all_feats.shape[0]} samples -> {fid_samples} samples"
-    )
-    all_feats = all_feats[:fid_samples]
-    # Convert to float64 for higher precision FID computation
-    all_feats_64 = all_feats.astype(np.float64)
-    mu = np.mean(all_feats_64, axis=0)
-    sigma = np.cov(all_feats_64, rowvar=False)
-
-    result = {"mu": mu, "sigma": sigma}
-
-    np_logits = jnp.concatenate(l_logits)
-    np_logits = np_logits[:num_samples]
-    np_logits = np_logits.reshape((-1, LDC, np_logits.shape[-1]))
-    np_logits = np_logits.transpose((1, 0, 2))  # (LDC, N//LDC, num_classes)
-    
-    all_logits = multihost_utils.process_allgather(np_logits)
-    all_logits = all_logits.reshape((-1, ) + all_logits.shape[2:])
-    all_logits = all_logits.transpose((1, 0, 2))  # (N//LDC, num_hosts*LDC, num_classes)
-    all_logits = all_logits.reshape(-1, all_logits.shape[-1])
-    all_logits = jax.device_get(all_logits)
-    all_logits = all_logits[:fid_samples]
-
-    result["logits"] = all_logits
-
-    return result
+    feats_all = np.concatenate(feats_all, axis=0)
+    logits_all = np.concatenate(logits_all, axis=0)
+    mu = np.mean(feats_all, axis=0)
+    sigma = np.cov(feats_all, rowvar=False)
+    return {"mu": mu, "sigma": sigma, "logits": logits_all}
 
 
 def compute_inception_score(logits, splits=10):
-    """
-    Compute Inception Score from logits.
-
-    Args:
-        logits: Raw logits from InceptionV3 model, shape [N, num_classes]
-        splits: Number of splits for computing IS (default: 10)
-
-    Returns:
-        is_mean: Mean inception score
-        is_std: Standard deviation of inception score
-    """
-    rng = np.random.RandomState(2020)
-    logits = logits[rng.permutation(logits.shape[0]), :]
-
-    # Convert logits to probabilities
-    probs = jax.nn.softmax(logits, axis=-1)
-    probs_64 = np.array(probs, dtype=np.float64)
-
-    # Split the probabilities
-    N = probs_64.shape[0]
-    split_size = N // splits
-
+    logits = np.asarray(logits)
+    probs = _softmax(logits, axis=-1)
+    n = probs.shape[0]
+    splits = max(1, min(int(splits), n))
+    chunk = n // splits
     scores = []
     for i in range(splits):
-        part = probs_64[i * split_size : (i + 1) * split_size]
-
-        # Compute p(y|x) - conditional distribution
-        py_x = part
-
-        # Compute p(y) - marginal distribution
+        part = probs[i * chunk : (i + 1) * chunk] if i < splits - 1 else probs[i * chunk :]
+        if part.shape[0] == 0:
+            continue
         py = np.mean(part, axis=0, keepdims=True)
-
-        # Compute KL divergence
-        kl_div = py_x * (np.log(py_x + 1e-10) - np.log(py + 1e-10))
-        kl_div = np.sum(kl_div, axis=1)
-        kl_div = np.mean(kl_div)
-
-        scores.append(np.exp(kl_div))
-
-    scores = np.array(scores, dtype=np.float64)
-    is_mean = np.mean(scores)
-    is_std = np.std(scores)
-
-    return is_mean, is_std
+        kl = np.sum(part * (np.log(np.clip(part, 1e-12, None)) - np.log(np.clip(py, 1e-12, None))), axis=1)
+        scores.append(np.exp(np.mean(kl)))
+    scores = np.asarray(scores, dtype=np.float64)
+    return float(np.mean(scores)), float(np.std(scores))
 
 
 def compute_fid_stats(
-    imagenet_root, output_dir, image_size, batch_size=200, overwrite=False
+    imagenet_root,
+    split,
+    image_size,
+    batch_size=200,
+    num_workers=4,
+    cache_path=None,
 ):
-    """Compute and save FID statistics for ImageNet using distributed loading and chunked gathering."""
-    from utils.data_util import create_imagenet_dataloader
-
-    log_for_0("Starting FID statistics computation...")
-
-    # Output path for FID stats
-    fid_stats_path = os.path.join(output_dir, f"imagenet_{image_size}_fid_stats.npz")
-
-    # Check if already exists
-    if not overwrite and os.path.exists(fid_stats_path):
-        log_for_0(f"FID stats already exist at {fid_stats_path}, skipping...")
-        return fid_stats_path
-
-    # Build Inception model
+    dataloader, _, _ = create_imagenet_dataloader(
+        imagenet_root=imagenet_root,
+        split=split,
+        batch_size=batch_size,
+        image_size=image_size,
+        num_workers=num_workers,
+        for_fid=True,
+    )
     inception_net = build_jax_inception(batch_size=batch_size)
 
-    # Create dataloader for training set (for FID reference)
-    # Use num_workers=0 to avoid fork() incompatibility with JAX multithreading
-    dataloader, dataset_size, true_total_samples = create_imagenet_dataloader(
-        imagenet_root, "train", batch_size, image_size, num_workers=0, for_fid=True
-    )
+    feats_all = []
+    logits_all = []
+    for batch_idx, batch in enumerate(dataloader):
+        images, _ = batch
+        images = _to_uint8_bhwc(images)
+        feats, logits = inception_net(images)
+        feats_all.append(feats)
+        logits_all.append(logits)
+        if (batch_idx + 1) % 100 == 0:
+            log_for_0(f"FID stats: processed {batch_idx + 1}/{len(dataloader)} batches")
 
-    log_for_0(f"Computing FID features for {dataset_size} samples per worker...")
-    log_for_0(f"Expected batches per worker: {len(dataloader)}")
+    feats_all = np.concatenate(feats_all, axis=0)
+    logits_all = np.concatenate(logits_all, axis=0)
+    mu = np.mean(feats_all, axis=0)
+    sigma = np.cov(feats_all, rowvar=False)
+    stats = {"mu": mu, "sigma": sigma, "logits": logits_all}
 
-    # Process data batch by batch and accumulate features
-    log_for_0("Processing batches and computing features...")
-    all_features_list = []
-
-    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Processing batches")):
-        images, labels = batch
-
-        # Convert images to numpy array format
-        if isinstance(images, list):
-            images_np = np.stack(images, axis=0)
-        else:
-            images_np = np.array(images)
-
-        # Compute features for this batch directly
-        batch_features = compute_batch_features(images_np, inception_net, batch_size)
-
-        # Move to CPU and accumulate
-        batch_features_cpu = jax.device_get(batch_features)
-        all_features_list.append(batch_features_cpu)
-
-        if batch_idx % 100 == 0:
-            log_for_0(
-                f"Worker {jax.process_index()}: Processed {batch_idx}/{len(dataloader)} batches"
-            )
-
-    # Concatenate all local features from this worker
-    local_features = np.concatenate(all_features_list, axis=0)
-    log_for_0(
-        f"Worker {jax.process_index()}: Local features shape: {local_features.shape}"
-    )
-
-    # Clear feature list to free memory
-    del all_features_list
-
-    # Gather features across all workers using chunked approach to avoid OOM
-    log_for_0("Gathering features across workers using chunked approach...")
-
-    # Use smaller chunk size to avoid OOM (10K samples per chunk)
-    chunk_size = 10000
-    all_gathered_features = []
-
-    for chunk_start in range(0, local_features.shape[0], chunk_size):
-        chunk_end = min(chunk_start + chunk_size, local_features.shape[0])
-        local_chunk = local_features[chunk_start:chunk_end]
-
-        log_for_0(
-            f"Worker {jax.process_index()}: Gathering chunk {chunk_start//chunk_size + 1}, "
-            f"samples {chunk_start}:{chunk_end} ({local_chunk.shape[0]} samples)"
-        )
-
-        # Convert to JAX array and gather this chunk across all processes
-        local_chunk_jax = jnp.array(local_chunk)
-
-        # Gather this chunk from all workers
-        gathered_chunk = multihost_utils.process_allgather(local_chunk_jax)
-        gathered_chunk = gathered_chunk.reshape(-1, gathered_chunk.shape[-1])
-
-        # Move to CPU to free memory
-        gathered_chunk_cpu = jax.device_get(gathered_chunk)
-        all_gathered_features.append(gathered_chunk_cpu)
-
-        log_for_0(
-            f"Worker {jax.process_index()}: Successfully gathered chunk {chunk_start//chunk_size + 1}, "
-            f"total shape: {gathered_chunk_cpu.shape}"
-        )
-
-    # Concatenate all gathered chunks
-    all_features_gathered = np.concatenate(all_gathered_features, axis=0)
-    log_for_0(f"Total features shape before truncation: {all_features_gathered.shape}")
-
-    # Truncate the padding by gathering
-    if all_features_gathered.shape[0] != true_total_samples:
-        log_for_0("Truncating to expected number of samples to fix padding...")
-        all_features_gathered = all_features_gathered[:true_total_samples]
-
-    log_for_0(f"Final features shape after truncation: {all_features_gathered.shape}")
-
-    # Clear local features to free memory
-    del local_features
-
-    # Compute statistics
-    log_for_0("Computing final statistics...")
-    mu = np.mean(all_features_gathered, axis=0)
-    sigma = np.cov(all_features_gathered, rowvar=False)
-
-    # Save statistics
-    os.makedirs(os.path.dirname(fid_stats_path), exist_ok=True)
-    np.savez(fid_stats_path, ref_mu=mu, ref_sigma=sigma)
-    log_for_0(f"FID statistics saved to {fid_stats_path}")
-
-    return fid_stats_path
-
-
-def compute_batch_features(batch_images, inception_net, batch_size):
-    """Compute Inception features for a batch of images."""
-    actual_batch_size = batch_images.shape[0]
-    inception_params = inception_net["params"]
-    inception_fn = inception_net["fn"]
-
-    # Convert uint8 [0,255] numpy to float32 [0,255] tensor
-    x = torch.tensor(batch_images, dtype=torch.float32)
-    x = x.permute(0, 3, 1, 2)  # BHWC → BCHW for PyTorch
-
-    # Apply resize and normalization, then convert to JAX format
-    x = resize.forward(x)  # Resize to 299x299 and normalize to [-1,1]
-    x = x.numpy().transpose(0, 2, 3, 1)  # BCHW → BHWC for JAX
-
-    # Pad batch to expected size if needed (for JAX compilation compatibility)
-    if actual_batch_size < batch_size:
-        # Pad with zeros to reach expected batch size
-        padding_size = batch_size - actual_batch_size
-        padding_shape = (padding_size,) + x.shape[1:]
-        padding = np.zeros(padding_shape, dtype=x.dtype)
-        x_padded = np.concatenate([x, padding], axis=0)
-    else:
-        x_padded = x
-
-    # Extract Inception features
-    pred, _, _ = inception_fn(inception_params, jax.lax.stop_gradient(x_padded))
-    pred = pred.squeeze(axis=1).squeeze(axis=1)
-
-    # Return only the features for actual samples (remove padding)
-    pred = pred[:actual_batch_size]
-
-    return jax.device_get(pred)
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True) if os.path.dirname(cache_path) else None
+        np.savez(cache_path, **stats)
+        log_for_0(f"Saved FID stats to {cache_path}")
+        return cache_path
+    return stats

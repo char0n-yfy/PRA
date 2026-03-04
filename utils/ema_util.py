@@ -1,30 +1,41 @@
-from functools import partial
+from copy import deepcopy
 
-import jax
-import jax.numpy as jnp
+import torch
+
 
 def const_schedule(step, ema_value):
-    return ema_value
+    return float(ema_value)
+
 
 def edm_schedule(step, ema_halflife_kimg):
-    ema_halflife_nimg = ema_halflife_kimg * 1000
-
+    ema_halflife_nimg = float(ema_halflife_kimg) * 1000.0
     ema_rampup_ratio = 0.05
-    ema_halflife_nimg = jnp.minimum(ema_halflife_nimg, step * 1024 * ema_rampup_ratio)
+    ema_halflife_nimg = min(ema_halflife_nimg, float(step) * 1024.0 * ema_rampup_ratio)
+    ema_beta = 0.5 ** (1024.0 / max(ema_halflife_nimg, 1e-8))
+    return float(ema_beta)
 
-    ema_beta = 0.5 ** (1024 / jnp.maximum(ema_halflife_nimg, 1e-8))
-    return ema_beta
 
 def ema_schedules(config):
-    ema_type = config.training.get("ema_type", "const")
-
+    ema_type = getattr(config.training, "ema_type", "const")
     if ema_type == "const":
         return const_schedule
-    elif ema_type == "edm":
+    if ema_type == "edm":
         return edm_schedule
-    else:
-        raise ValueError("Unknown EMA!")
+    raise ValueError("Unknown EMA type.")
 
 
-def update_ema(ema_params, params, alpha):
-    return jax.tree_map(lambda e, p: alpha * e + (1 - alpha) * p, ema_params, params)
+@torch.no_grad()
+def update_ema(ema_model, model, alpha):
+    alpha = float(alpha)
+    for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+        p_ema.data.mul_(alpha).add_(p.data, alpha=(1.0 - alpha))
+    for b_ema, b in zip(ema_model.buffers(), model.buffers()):
+        b_ema.data.copy_(b.data)
+
+
+def clone_model(model):
+    ema_model = deepcopy(model)
+    ema_model.eval()
+    for p in ema_model.parameters():
+        p.requires_grad_(False)
+    return ema_model

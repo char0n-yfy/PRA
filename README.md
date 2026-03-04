@@ -129,7 +129,7 @@ After data preparation, you need to configure your FID cache reference in the co
 
 #### 1. Update Config Files
 
-Edit your config file (e.g., `configs/pMF_B_16_config.yml`) and replace the placeholder values:
+Edit your config file (e.g., `configs/base/pMF_B_16_config.yml`) and replace the placeholder values:
 
 ```yaml
 dataset:
@@ -144,14 +144,14 @@ logging:
 
 #### 2. Available Config Files
 
-- `configs/pMF_B_16_config.yml` - Configuration for pMF-B/16 model training (recommended)
-- `configs/pMF_B_32_config.yml` - Configuration for pMF-B/32 model training
-- `configs/pMF_L_16_config.yml` - Configuration for pMF-L/16 model training
-- `configs/pMF_L_32_config.yml` - Configuration for pMF-L/32 model training
+- `configs/base/pMF_B_16_config.yml` - Configuration for pMF-B/16 model training (recommended)
+- `configs/base/pMF_B_32_config.yml` - Configuration for pMF-B/32 model training
+- `configs/base/pMF_L_16_config.yml` - Configuration for pMF-L/16 model training
+- `configs/base/pMF_L_32_config.yml` - Configuration for pMF-L/32 model training
 - `configs/default.py` - Default configuration (Python format, used as base)
 
 **Configuration Hierarchy:**
-The system uses a hierarchical approach where `pMF_B_16_config.yml` and `eval_config.yml` override specific parameters from `default.py`. This allows you to customize only the parameters you need while keeping sensible defaults.
+The system uses a hierarchical approach where `configs/base/pMF_B_16_config.yml` and `configs/eval_config.yml` override specific parameters from `configs/default.py`. This allows you to customize only the parameters you need while keeping sensible defaults.
 Make sure to update both the dataset root path and the FID cache reference path according to your data preparation output.
 
 ## Training
@@ -170,7 +170,7 @@ bash scripts/launch.sh JOB_NAME
 The training system uses two config files:
 
 - **`configs/default.py`** - Base configuration with all default hyperparameters
-- **`configs/pMF_B_16_config.yml`** - Model-specific overrides for pMF-B/16 training
+- **`configs/base/pMF_B_16_config.yml`** - Model-specific overrides for pMF-B/16 training
 
 The system merges these files, allowing you to customize only the parameters you need.
 
@@ -195,7 +195,7 @@ model:
     noise_scale: 1.0                 # Set noise scale
 ```
 
-for more details on configuration options, refer to `configs/default.py` and `configs/pMF_B_16_config.yml`.
+for more details on configuration options, refer to `configs/default.py` and `configs/base/pMF_B_16_config.yml`.
 
 ## License
 
