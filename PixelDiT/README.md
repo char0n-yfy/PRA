@@ -40,6 +40,39 @@ model = PixelDiT_B(input_size=256, num_classes=1000)
 test_model("PixelDiT-B", hidden_size=768, patch_depth=12, pixel_depth=2, num_heads=12)
 ```
 
+### Independent PixelDiT-T2I x pMF Subproject
+
+New training/inference entrypoints are now under this folder:
+
+- `PixelDiT/main.py`: training launcher
+- `PixelDiT/infer.py`: external-CFG inference launcher
+- `PixelDiT/configs/base_t2i_pmf.yml`: base config
+
+Smoke test:
+
+```bash
+python PixelDiT/main.py --config PixelDiT/configs/base_t2i_pmf.yml --smoke-test
+```
+
+Train (DDP example):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  PixelDiT/main.py --config PixelDiT/configs/base_t2i_pmf.yml
+```
+
+Infer (cache-driven semantic condition):
+
+```bash
+python PixelDiT/infer.py \
+  --config PixelDiT/configs/base_t2i_pmf.yml \
+  --checkpoint /path/to/checkpoint.pt \
+  --cache-root /path/to/imagenet_sem_cache_fp32 \
+  --split val --sample-index 0 \
+  --num-steps 1 --omega 7.5 --t-min 0.2 --t-max 1.0 \
+  --output output.png
+```
+
 ### Requirements
 
 ```
