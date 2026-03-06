@@ -17,6 +17,7 @@ if __package__ is None or __package__ == "":
 
 from PixelDiT.models import PixelDiTT2IPMF
 from PixelDiT.utils.semantic_cache import DinoSemanticCache
+from PixelDiT.utils.edge import sobel_edge_map
 
 
 def _load_yaml(path: str) -> dict:
@@ -26,6 +27,7 @@ def _load_yaml(path: str) -> dict:
 
 def _build_model(cfg: dict, device: torch.device) -> PixelDiTT2IPMF:
     m = cfg["model"]
+    spatial = cfg.get("spatial", {}) or {}
     model = PixelDiTT2IPMF(
         input_size=int(m["input_size"]),
         patch_size=int(m["patch_size"]),
@@ -39,6 +41,10 @@ def _build_model(cfg: dict, device: torch.device) -> PixelDiTT2IPMF:
         pixel_num_heads=int(m["pixel_num_heads"]),
         mlp_ratio=float(m["mlp_ratio"]),
         sem_in_dim=int(m["sem_in_dim"]),
+        sem_num_tokens=int(m.get("sem_num_tokens", 64)),
+        sem_pool_num_heads=int(m.get("sem_pool_num_heads", 12)),
+        enable_edge_cond=bool(spatial.get("enable_edge", False)),
+        edge_channels=int(spatial.get("edge_channels", 64)),
         use_qknorm=bool(m["use_qknorm"]),
         use_swiglu=bool(m["use_swiglu"]),
         use_rope=bool(m["use_rope"]),
@@ -97,12 +103,46 @@ def _to_uint8(x: torch.Tensor) -> np.ndarray:
     return x
 
 
+def _load_edge_image_tensor(path: str, image_size: int, device: torch.device) -> torch.Tensor:
+    img = Image.open(path).convert("RGB")
+    img = img.resize((int(image_size), int(image_size)), resample=Image.BICUBIC)
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
+    x = x * 2.0 - 1.0
+    return x
+
+
+def _build_edge_map(args, cfg: dict, device: torch.device) -> torch.Tensor | None:
+    spatial = cfg.get("spatial", {}) or {}
+    enable_edge = bool(spatial.get("enable_edge", False))
+    if not enable_edge:
+        return None
+
+    image_size = int(cfg["dataset"]["image_size"])
+    sigma_cfg = float(spatial.get("edge_blur_sigma", 1.0))
+    thresh_cfg = float(spatial.get("edge_threshold", 0.0))
+    sigma = float(args.edge_blur_sigma) if args.edge_blur_sigma is not None else sigma_cfg
+    threshold = float(args.edge_threshold) if args.edge_threshold is not None else thresh_cfg
+
+    if args.edge_image:
+        edge_src = _load_edge_image_tensor(args.edge_image, image_size=image_size, device=device)
+        edge_map = sobel_edge_map(edge_src, blur_sigma=sigma, threshold=threshold)
+        print(f"[info] spatial edge enabled with --edge-image: {args.edge_image}")
+        return edge_map
+
+    # Keep inference runnable when spatial is enabled but no explicit edge source is provided.
+    edge_map = torch.zeros((1, 1, image_size, image_size), device=device, dtype=torch.float32)
+    print("[warn] spatial.enable_edge=true but --edge-image is empty; using zero edge map.")
+    return edge_map
+
+
 def run_infer(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = _load_yaml(args.config)
 
     model = _build_model(cfg, device)
     _load_checkpoint(args.checkpoint, model)
+    edge_map = _build_edge_map(args, cfg, device)
 
     if args.seed is not None:
         torch.manual_seed(int(args.seed))
@@ -110,7 +150,7 @@ def run_infer(args):
             torch.cuda.manual_seed_all(int(args.seed))
 
     sem_cond = _load_sem_tokens(args, cfg, device)
-    b, l_sem, d_sem = sem_cond.shape
+    b, _l_sem, _d_sem = sem_cond.shape
     assert b == 1, "inference currently supports batch_size=1"
 
     h_img = int(cfg["dataset"]["image_size"])
@@ -129,17 +169,19 @@ def run_infer(args):
             t = torch.full((1,), float(t_val.item()), device=device, dtype=torch.float32)
             h = torch.full((1,), float(h_val.item()), device=device, dtype=torch.float32)
 
-            out_cond = model(x=z, t=t, h=h, sem_tokens=sem_cond)
+            out_cond = model(x=z, t=t, h=h, sem_tokens=sem_cond, edge_map=edge_map)
             x_hat_u_cond = out_cond["x_hat_u"]
             u_cond = (z - x_hat_u_cond) / torch.clamp(t.view(-1, 1, 1, 1), min=float(args.t_eps))
 
-            null_sem = model.get_null_sem_tokens(
-                batch_size=1,
-                seq_len=l_sem,
-                device=device,
-                dtype=sem_cond.dtype,
+            drop_mask = torch.ones((1,), device=device, dtype=torch.bool)
+            out_uncond = model(
+                x=z,
+                t=t,
+                h=h,
+                sem_tokens=sem_cond,
+                sem_drop_mask=drop_mask,
+                edge_map=edge_map,
             )
-            out_uncond = model(x=z, t=t, h=h, sem_tokens=null_sem)
             x_hat_u_uncond = out_uncond["x_hat_u"]
             u_uncond = (z - x_hat_u_uncond) / torch.clamp(t.view(-1, 1, 1, 1), min=float(args.t_eps))
 
@@ -170,6 +212,9 @@ def main():
     parser.add_argument("--split", type=str, default="val")
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--sem-tokens-file", type=str, default="")
+    parser.add_argument("--edge-image", type=str, default="")
+    parser.add_argument("--edge-blur-sigma", type=float, default=None)
+    parser.add_argument("--edge-threshold", type=float, default=None)
 
     args = parser.parse_args()
     run_infer(args)

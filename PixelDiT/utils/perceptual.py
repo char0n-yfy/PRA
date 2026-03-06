@@ -143,7 +143,8 @@ class PerceptualLoss:
         conv_vec = torch.zeros((bsz,), device=self.device, dtype=torch.float32)
 
         if self.lpips_model is not None:
-            out = self.lpips_model(pred_crop, gt_crop, normalize=False)
+            with cuda_bf16_autocast(self.device):
+                out = self.lpips_model(pred_crop, gt_crop, normalize=False)
             lpips_vec = out.reshape(out.shape[0], -1).mean(dim=1)
 
         if self.convnext_model is not None:

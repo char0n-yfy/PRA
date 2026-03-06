@@ -190,6 +190,91 @@ class Attention(nn.Module):
         return x
 
 
+class CrossAttention(nn.Module):
+    """Cross attention: queries attend to key/value tokens.
+
+    Shapes:
+      q:  (B, T, D)
+      kv: (B, N, D)
+      out:(B, T, D)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        use_rmsnorm: bool = False,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = int(num_heads)
+        self.head_dim = dim // self.num_heads
+
+        norm_layer = RMSNorm if use_rmsnorm else nn.LayerNorm
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor, kv_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        b, t, d = q.shape
+        _, n, _ = kv.shape
+
+        q = self.q_proj(q).reshape(b, t, self.num_heads, self.head_dim).transpose(1, 2)  # (B,H,T,hd)
+        k = self.k_proj(kv).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)  # (B,H,N,hd)
+        v = self.v_proj(kv).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)  # (B,H,N,hd)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        attn_mask = None
+        if kv_mask is not None:
+            # F.scaled_dot_product_attention expects boolean masks with True = keep, False = masked.
+            if kv_mask.ndim != 2 or kv_mask.shape != (b, n):
+                raise ValueError(f"kv_mask must be (B,N), got {tuple(kv_mask.shape)}")
+            attn_mask = kv_mask[:, None, None, :].expand(b, self.num_heads, t, n)
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).reshape(b, t, d)
+        return self.out_proj(out)
+
+
+class CrossAttentionPooler(nn.Module):
+    """Attention pooling with learnable queries (no extra transformer depth)."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_queries: int,
+        qkv_bias: bool = True,
+        qk_norm: bool = True,
+        use_rmsnorm: bool = True,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.num_queries = int(num_queries)
+        self.queries = nn.Parameter(torch.zeros(1, self.num_queries, self.dim))
+        self.attn = CrossAttention(
+            dim=self.dim,
+            num_heads=int(num_heads),
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            use_rmsnorm=use_rmsnorm,
+        )
+
+    def forward(self, tokens: torch.Tensor, tokens_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ValueError(f"tokens must be (B,N,D), got {tuple(tokens.shape)}")
+        b = tokens.shape[0]
+        q = self.queries.expand(b, -1, -1)
+        return self.attn(q, tokens, kv_mask=tokens_mask)
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
         super().__init__()

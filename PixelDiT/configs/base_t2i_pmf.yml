@@ -1,6 +1,7 @@
 dataset:
-  root: /path/to/imagenet
-  image_size: 256
+  # Match the outer pMF configs (edit if your dataset is elsewhere).
+  root: /root/autodl-tmp/imagenet
+  image_size: 512
   train_split: train
   val_split: val
   num_workers: 8
@@ -11,26 +12,45 @@ dataset:
   augment_train: false
 
 semantic:
-  use_offline_cache: true
-  cache_root: /path/to/imagenet_sem_cache_fp32
+  # Online DINO extraction (no offline cache).
+  use_offline_cache: false
+  # Unused when use_offline_cache=false. Kept for easy switching.
+  cache_root: /root/autodl-tmp/imagenet_sem_cache_fp32_512
   mode: dino
+  # Local HF snapshot dir (recommended for offline runs) or a HF repo id.
+  dino_model_name: /root/autodl-tmp/hf_models/dinov2-base
+  dino_use_dense: true
+  dino_image_size: 512
   dino_feature_dim: 768
+  # Only used for offline-cache validation/shape when use_offline_cache=true.
   num_dino_tokens: 4
   strict: true
 
+spatial:
+  # Optional spatial (edge) condition injection into the patch-level image stream.
+  enable_edge: true
+  # Edge preprocessing (computed from clean x during training).
+  edge_blur_sigma: 1.0
+  edge_threshold: 0.0
+  # SpatialNet output channels (C_e). Typical: 64 or 128.
+  edge_channels: 64
+
 model:
-  input_size: 256
+  input_size: 512
   patch_size: 16
   in_channels: 3
-  hidden_size: 1024
+  # PixelDiT-T2I-1B: N=14, M=2, D=1536, D_pix=16, heads=24.
+  hidden_size: 1536
   pixel_dim: 16
   patch_depth: 14
   pixel_depth: 2
   pixel_head_depth: 1
-  num_heads: 16
-  pixel_num_heads: 16
+  num_heads: 24
+  pixel_num_heads: 24
   mlp_ratio: 4.0
   sem_in_dim: 768
+  sem_num_tokens: 64
+  sem_pool_num_heads: 12
   use_qknorm: true
   use_swiglu: true
   use_rope: true
@@ -40,44 +60,98 @@ model:
 
 training:
   seed: 42
-  num_epochs: 3
-  batch_size: 8
+  num_epochs: 30
+  # Global batch size. Must be divisible by world_size.
+  batch_size: 36
+  gradient_accumulation_steps: 1
+  # Match outer pMF naming (steps between scalar logs).
+  log_per_step: 100
   learning_rate: 3.0e-4
   weight_decay: 0.0
   grad_clip: 1.0
   use_amp: true
   amp_dtype: bf16
   class_dropout_prob: 0.1
-  noise_scale: 1.0
-  t_eps: 0.05
+  noise_scale: 2.0
+  t_eps: 0.025
 
 time_sampling:
   data_proportion: 0.5
-  logit_mean: 0.0
-  logit_std: 1.0
+  # Align with outer pMF sampling (t,r ~ sigmoid(N(P_mean,P_std)) with optional tr_uniform mixing).
+  P_mean: 0.0
+  P_std: 0.8
+  tr_uniform: true
+  tr_uniform_prob: 0.1
 
 loss:
   norm_p: 0.5
   norm_eps: 0.001
-  perceptual_max_t: 1.0
-  lpips_weight: 1.0
-  convnext_weight: 0.2
+  # Perceptual losses only apply to low-noise samples (t <= perceptual_max_t).
+  # Recommended default for attack/regeneration training: 0.4
+  perceptual_max_t: 0.4
+  lpips_weight: 0.4
+  convnext_weight: 0.1
   enable_lpips: true
   enable_convnext: true
-  convnext_model_name: facebook/convnextv2-base-22k-224
+  # Local HF snapshot dir (recommended for offline runs) or a HF repo id.
+  convnext_model_name: /root/autodl-tmp/hf_models/convnextv2-base-22k-224
 
 evaluation:
-  enabled: false
+  enabled: true
+  run_every_n_epochs: 1
+  fail_on_error: false
+  epoch_max_samples: 64
   max_samples: 1000
+  batch_size: 20
+  num_workers: 8
+  seed: 123
+  t_eps: 0.025
+  posthoc_t_values: [0.05, 0.10, 0.20, 0.30]
+  regen_t_values: [0.80, 0.90, 1.00]
+  regen_num_variants: 4
+  sweep:
+    posthoc:
+      num_steps: [1]
+      omegas: [1.0, 1.5]
+      intervals:
+        - [0.0, 1.0]
+    regen:
+      num_steps: [1, 2]
+      omegas: [1.0, 4.0]
+      intervals:
+        - [0.1, 0.9]
+  metrics:
+    enable_clip: true
+    clip_model_name: /root/autodl-tmp/hf_models/clip-vit-large-patch14
+  best:
+    enabled: true
+    save_overall: false
+    min_improvement: 1.0e-6
+    posthoc_lpips_weight: 10.0
+    regen_clip_weight: 0.5
+    regen_div_weight: 0.3
+    overall_posthoc_weight: 0.5
+    overall_regen_weight: 0.5
+  visualization:
+    save: true
+    to_tensorboard: true
+    num_images: 8
+    regen_show_variants: 4
 
 logging:
-  log_interval: 100
   tb: true
+  # Flush tensorboard event file every N scalar writes (reduce fsync/io overhead).
+  tb_flush_every: 100
+
+diagnostics:
+  # Low-frequency probes for CFG branch separation and edge-conditioning usage.
+  cfg_probe_interval: 50000
+  cfg_probe_batch_size: 28
 
 checkpoint:
-  save_interval: 1000
+  save_interval: 100000
   save_per_epoch: true
-  keep_last_k: 3
+  keep_last_k: 1
 
 ddp:
   backend: nccl

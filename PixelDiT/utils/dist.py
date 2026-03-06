@@ -66,8 +66,8 @@ def init_distributed(backend: str = "nccl"):
 
 def all_reduce_mean_scalar(value: torch.Tensor) -> torch.Tensor:
     if not is_distributed():
-        return value
-    x = value.detach().clone()
+        return value.to(dtype=torch.float32)
+    x = value.detach().clone().to(dtype=torch.float32)
     dist.all_reduce(x, op=dist.ReduceOp.SUM)
     x /= float(get_world_size())
     return x
