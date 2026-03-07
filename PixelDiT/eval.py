@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import gc
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -112,7 +113,10 @@ def _build_model(cfg, device: torch.device) -> PixelDiTT2IPMF:
 
 
 def _load_checkpoint(path: str, model: torch.nn.Module) -> Tuple[int, int]:
-    ckpt = torch.load(path, map_location="cpu")
+    # Epoch-end eval loads the full training checkpoint, which includes optimizer/scaler/RNG
+    # states. PyTorch 2.6 defaults torch.load(..., weights_only=True), which rejects these
+    # non-tensor objects. We trust locally produced checkpoints here and opt into full load.
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict) and "model" in ckpt:
         state = ckpt["model"]
         step = int(ckpt.get("step", 0))
@@ -329,7 +333,7 @@ def _make_seed(base_seed: int, sample_idx: int, t_val: float, variant_idx: int) 
     return int(base_seed + sample_idx * 100003 + int(round(t_val * 1000.0)) * 101 + variant_idx * 1009)
 
 
-def _build_eval_loader(cfg, max_samples: int) -> DataLoader:
+def _build_eval_loader(cfg, max_samples: int, num_workers_override: Optional[int] = None) -> DataLoader:
     eval_bs = int(getattr(cfg.evaluation, "batch_size", 1))
     if eval_bs < 1:
         raise ValueError(f"evaluation.batch_size must be >=1, got {eval_bs}")
@@ -338,13 +342,15 @@ def _build_eval_loader(cfg, max_samples: int) -> DataLoader:
     if int(max_samples) > 0:
         n = min(int(max_samples), len(val_ds))
         val_ds = Subset(val_ds, list(range(n)))
+    num_workers = int(num_workers_override) if num_workers_override is not None else int(getattr(cfg.evaluation, "num_workers", 2))
     return DataLoader(
         val_ds,
         batch_size=eval_bs,
         shuffle=False,
-        num_workers=int(getattr(cfg.evaluation, "num_workers", 2)),
+        num_workers=max(0, num_workers),
         pin_memory=bool(getattr(cfg.dataset, "pin_memory", True)),
         drop_last=False,
+        persistent_workers=False,
     )
 
 
@@ -471,259 +477,112 @@ def run_eval(args):
     torch.manual_seed(int(cfg.evaluation.seed))
     torch.cuda.manual_seed_all(int(cfg.evaluation.seed))
 
-    model = _build_model(cfg, device)
-    step_from_ckpt, epoch_from_ckpt = _load_checkpoint(args.checkpoint, model)
-    global_step = int(args.global_step) if args.global_step is not None else int(step_from_ckpt)
+    writer = None
+    loader = None
+    model = None
+    cache = cond_encoder = dino_metric = None
+    lpips_metric = ssim_metric = clip_encoder = None
+    try:
+        model = _build_model(cfg, device)
+        step_from_ckpt, epoch_from_ckpt = _load_checkpoint(args.checkpoint, model)
+        global_step = int(args.global_step) if args.global_step is not None else int(step_from_ckpt)
 
-    base_workdir = args.workdir.strip() if args.workdir.strip() else _default_workdir_from_ckpt(args.checkpoint)
-    eval_root = os.path.join(base_workdir, "eval", _now_stamp())
-    os.makedirs(eval_root, exist_ok=True)
-    tb_dir = os.path.join(eval_root, "tensorboard")
-    writer = SummaryWriter(log_dir=tb_dir)
-    checkpoints_dir = os.path.join(base_workdir, "checkpoints")
+        base_workdir = args.workdir.strip() if args.workdir.strip() else _default_workdir_from_ckpt(args.checkpoint)
+        eval_root = os.path.join(base_workdir, "eval", _now_stamp())
+        os.makedirs(eval_root, exist_ok=True)
+        tb_dir = os.path.join(eval_root, "tensorboard")
+        writer = SummaryWriter(log_dir=tb_dir)
+        checkpoints_dir = os.path.join(base_workdir, "checkpoints")
 
-    max_samples = int(args.max_samples) if args.max_samples is not None else int(cfg.evaluation.max_samples)
-    loader = _build_eval_loader(cfg, max_samples=max_samples)
+        max_samples = int(args.max_samples) if args.max_samples is not None else int(cfg.evaluation.max_samples)
+        num_workers_override = getattr(args, "num_workers_override", None)
+        loader = _build_eval_loader(cfg, max_samples=max_samples, num_workers_override=num_workers_override)
 
-    cache, cond_encoder, dino_metric = _build_semantic_sources(cfg, device)
-    lpips_metric = LPIPSMetric(device=device)
-    ssim_metric = SSIMMetric(channels=int(cfg.model.in_channels), device=device)
-    use_clip = bool(getattr(cfg.evaluation.metrics, "enable_clip", False))
-    clip_encoder = None
-    if use_clip:
-        clip_encoder = CLIPImageEncoder(
-            model_name=str(cfg.evaluation.metrics.clip_model_name),
-            device=device,
-        )
-
-    posthoc_sweeps = _parse_sweep(cfg.evaluation, "posthoc")
-    regen_sweeps = _parse_sweep(cfg.evaluation, "regen")
-
-    posthoc_t_values = [float(x) for x in list(cfg.evaluation.posthoc_t_values)]
-    regen_t_values = [float(x) for x in list(cfg.evaluation.regen_t_values)]
-    regen_num_variants = int(cfg.evaluation.regen_num_variants)
-    t_eps = float(getattr(cfg.evaluation, "t_eps", cfg.training.t_eps))
-    noise_scale = float(cfg.training.noise_scale)
-
-    enable_edge = bool(getattr(cfg.spatial, "enable_edge", False))
-    edge_blur_sigma = float(getattr(cfg.spatial, "edge_blur_sigma", 1.0))
-    edge_threshold = float(getattr(cfg.spatial, "edge_threshold", 0.0))
-
-    save_vis = bool(getattr(cfg.evaluation.visualization, "save", True))
-    vis_to_tb = bool(getattr(cfg.evaluation.visualization, "to_tensorboard", True))
-    vis_num_images = int(getattr(cfg.evaluation.visualization, "num_images", 8))
-    vis_regen_variants = int(getattr(cfg.evaluation.visualization, "regen_show_variants", 4))
-
-    results = {
-        "config": os.path.abspath(args.config),
-        "checkpoint": os.path.abspath(args.checkpoint),
-        "global_step": global_step,
-        "epoch": int(epoch_from_ckpt),
-        "posthoc": {},
-        "regen": {},
-    }
-
-    best_cfg = getattr(cfg.evaluation, "best", SimpleNamespace())
-    best_enabled = bool(getattr(best_cfg, "enabled", True))
-    best_save_overall = bool(getattr(best_cfg, "save_overall", False))
-    best_min_improvement = float(getattr(best_cfg, "min_improvement", 1e-6))
-    best_posthoc_lpips_w = float(getattr(best_cfg, "posthoc_lpips_weight", 10.0))
-    best_regen_clip_w = float(getattr(best_cfg, "regen_clip_weight", 0.5))
-    best_regen_div_w = float(getattr(best_cfg, "regen_div_weight", 0.3))
-    best_overall_w_posthoc = float(getattr(best_cfg, "overall_posthoc_weight", 0.5))
-    best_overall_w_regen = float(getattr(best_cfg, "overall_regen_weight", 0.5))
-
-    posthoc_best_candidate = None
-    regen_best_candidate = None
-
-    def get_sem_cond_batch(global_indices: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        if cache is not None:
-            idx = global_indices.to(device="cpu", dtype=torch.int64)
-            sem = cache.get_batch(split=str(cfg.dataset.val_split), indices=idx, device=device)
-            return sem.to(dtype=torch.float32)
-        assert cond_encoder is not None
-        return cond_encoder.encode(x, amp_dtype=torch.bfloat16).to(dtype=torch.float32)
-
-    # ---------------------- Task 1: posthoc low-noise ----------------------
-    for sweep in posthoc_sweeps:
-        tag = sweep.tag
-        safe_tag = sweep.safe_tag
-        acc = {
-            t: {"psnr": [], "ssim": [], "lpips": []}
-            for t in posthoc_t_values
-        }
-        vis_rows: Dict[float, List[torch.Tensor]] = {t: [] for t in posthoc_t_values}
-        vis_seen: Dict[float, int] = {t: 0 for t in posthoc_t_values}
-
-        for _batch_i, batch in enumerate(loader):
-            global_idx, images, _labels = batch
-            x = images.to(device=device, non_blocking=True)
-            bsz = int(x.shape[0])
-            sem_cond_batch = get_sem_cond_batch(global_idx, x)
-            edge_map_batch = (
-                sobel_edge_map(x, blur_sigma=edge_blur_sigma, threshold=edge_threshold) if enable_edge else None
+        cache, cond_encoder, dino_metric = _build_semantic_sources(cfg, device)
+        lpips_metric = LPIPSMetric(device=device)
+        ssim_metric = SSIMMetric(channels=int(cfg.model.in_channels), device=device)
+        use_clip = bool(getattr(cfg.evaluation.metrics, "enable_clip", False))
+        if use_clip:
+            clip_encoder = CLIPImageEncoder(
+                model_name=str(cfg.evaluation.metrics.clip_model_name),
+                device=device,
             )
 
-            for t_val in posthoc_t_values:
-                for bi in range(bsz):
-                    x_b = x[bi : bi + 1]
-                    sem_b = sem_cond_batch[bi : bi + 1]
-                    edge_b = edge_map_batch[bi : bi + 1] if edge_map_batch is not None else None
-                    sample_key = int(global_idx[bi].item())
+        posthoc_sweeps = _parse_sweep(cfg.evaluation, "posthoc")
+        regen_sweeps = _parse_sweep(cfg.evaluation, "regen")
 
-                    g = torch.Generator(device=device)
-                    g.manual_seed(_make_seed(int(cfg.evaluation.seed), sample_key, t_val, 0))
-                    eps = torch.randn(x_b.shape, device=device, dtype=x_b.dtype, generator=g)
-                    z_t = (1.0 - t_val) * x_b + t_val * (noise_scale * eps)
-                    x_hat = _run_guided(
-                        model=model,
-                        z_start=z_t,
-                        t_start=t_val,
-                        r_end=0.0,
-                        num_steps=sweep.num_steps,
-                        sem_cond=sem_b,
-                        edge_map=edge_b,
-                        omega=sweep.omega,
-                        t_min=sweep.t_min,
-                        t_max=sweep.t_max,
-                        t_eps=t_eps,
-                    ).clamp(-1.0, 1.0)
+        posthoc_t_values = [float(x) for x in list(cfg.evaluation.posthoc_t_values)]
+        regen_t_values = [float(x) for x in list(cfg.evaluation.regen_t_values)]
+        regen_num_variants = int(cfg.evaluation.regen_num_variants)
+        t_eps = float(getattr(cfg.evaluation, "t_eps", cfg.training.t_eps))
+        noise_scale = float(cfg.training.noise_scale)
 
-                    x01 = _to_01(x_b)
-                    y01 = _to_01(x_hat)
-                    mse = torch.mean((x01 - y01) ** 2, dim=(1, 2, 3))
-                    psnr = float(_psnr_from_mse(mse).mean().item())
-                    ssim = float(ssim_metric(x01, y01).mean().item())
-                    lp = float(lpips_metric(x_hat, x_b).mean().item())
+        enable_edge = bool(getattr(cfg.spatial, "enable_edge", False))
+        edge_blur_sigma = float(getattr(cfg.spatial, "edge_blur_sigma", 1.0))
+        edge_threshold = float(getattr(cfg.spatial, "edge_threshold", 0.0))
 
-                    acc[t_val]["psnr"].append(psnr)
-                    acc[t_val]["ssim"].append(ssim)
-                    acc[t_val]["lpips"].append(lp)
+        save_vis = bool(getattr(cfg.evaluation.visualization, "save", True))
+        vis_to_tb = bool(getattr(cfg.evaluation.visualization, "to_tensorboard", True))
+        vis_num_images = int(getattr(cfg.evaluation.visualization, "num_images", 8))
+        vis_regen_variants = int(getattr(cfg.evaluation.visualization, "regen_show_variants", 4))
 
-                    if (save_vis or vis_to_tb) and vis_seen[t_val] < vis_num_images:
-                        edge_vis = torch.zeros_like(x_b)
-                        if edge_b is not None:
-                            edge_vis = edge_b.repeat(1, 3, 1, 1) * 2.0 - 1.0
-                        z_t_vis = z_t.clamp(-1.0, 1.0)
-                        vis_rows[t_val].extend(
-                            [
-                                x_b[0].detach().cpu(),
-                                z_t_vis[0].detach().cpu(),
-                                edge_vis[0].detach().cpu(),
-                                x_hat[0].detach().cpu(),
-                            ]
-                        )
-                        vis_seen[t_val] += 1
-
-        metrics_to_tb = {}
-        posthoc_out = {}
-        all_psnr, all_ssim, all_lpips = [], [], []
-        for t_val in posthoc_t_values:
-            t_str = f"{t_val:.2f}"
-            mean_psnr = float(np.mean(acc[t_val]["psnr"])) if acc[t_val]["psnr"] else float("nan")
-            mean_ssim = float(np.mean(acc[t_val]["ssim"])) if acc[t_val]["ssim"] else float("nan")
-            mean_lp = float(np.mean(acc[t_val]["lpips"])) if acc[t_val]["lpips"] else float("nan")
-            posthoc_out[t_str] = {"psnr": mean_psnr, "ssim": mean_ssim, "lpips": mean_lp}
-            metrics_to_tb[f"eval/posthoc/psnr_t{t_str}/mean/{tag}"] = mean_psnr
-            metrics_to_tb[f"eval/posthoc/ssim_t{t_str}/mean/{tag}"] = mean_ssim
-            metrics_to_tb[f"eval/posthoc/lpips_t{t_str}/mean/{tag}"] = mean_lp
-            all_psnr.append(mean_psnr)
-            all_ssim.append(mean_ssim)
-            all_lpips.append(mean_lp)
-
-            if save_vis or vis_to_tb:
-                out_path = os.path.join(eval_root, "vis", "posthoc", f"{safe_tag}_t{t_str}.png")
-                grid = _make_vis_grid(vis_rows[t_val], nrow=4)
-                if save_vis:
-                    _save_grid(grid, out_path=out_path)
-                if vis_to_tb and grid is not None:
-                    writer.add_image(f"eval/vis/posthoc/t{t_str}/{safe_tag}", grid, global_step)
-
-        metrics_to_tb[f"eval/posthoc/psnr/mean_over_t/{tag}"] = float(np.mean(all_psnr))
-        metrics_to_tb[f"eval/posthoc/ssim/mean_over_t/{tag}"] = float(np.mean(all_ssim))
-        metrics_to_tb[f"eval/posthoc/lpips/mean_over_t/{tag}"] = float(np.mean(all_lpips))
-        _write_scalars(writer, global_step, metrics_to_tb)
-        score_posthoc = _score_posthoc(
-            {
-                "psnr": metrics_to_tb[f"eval/posthoc/psnr/mean_over_t/{tag}"],
-                "lpips": metrics_to_tb[f"eval/posthoc/lpips/mean_over_t/{tag}"],
-            },
-            lpips_weight=best_posthoc_lpips_w,
-        )
-        results["posthoc"][tag] = {
-            "sweep": {"num_steps": sweep.num_steps, "omega": sweep.omega, "t_min": sweep.t_min, "t_max": sweep.t_max},
-            "per_t": posthoc_out,
-            "mean_over_t": {
-                "psnr": metrics_to_tb[f"eval/posthoc/psnr/mean_over_t/{tag}"],
-                "ssim": metrics_to_tb[f"eval/posthoc/ssim/mean_over_t/{tag}"],
-                "lpips": metrics_to_tb[f"eval/posthoc/lpips/mean_over_t/{tag}"],
-            },
-            "score_posthoc": float(score_posthoc),
+        results = {
+            "config": os.path.abspath(args.config),
+            "checkpoint": os.path.abspath(args.checkpoint),
+            "global_step": global_step,
+            "epoch": int(epoch_from_ckpt),
+            "posthoc": {},
+            "regen": {},
         }
-        cand = {
-            "tag": tag,
-            "score": float(score_posthoc),
-            "infer_cfg": {
-                "omega": float(sweep.omega),
-                "t_min": float(sweep.t_min),
-                "t_max": float(sweep.t_max),
-                "num_steps": int(sweep.num_steps),
-                "t_eps": float(t_eps),
-            },
-            "metrics": results["posthoc"][tag]["mean_over_t"],
-        }
-        if (posthoc_best_candidate is None) or (cand["score"] > posthoc_best_candidate["score"]):
-            posthoc_best_candidate = cand
-        print(f"[posthoc] done {tag}")
 
-    # ---------------------- Task 2: high-noise regeneration ----------------------
-    for sweep in regen_sweeps:
-        tag = sweep.tag
-        safe_tag = sweep.safe_tag
-        acc = {
-            t: {
-                "dino_sim": [],
-                "clip_sim": [],
-                "div_lpips": [],
-                "div_dino": [],
-            }
-            for t in regen_t_values
-        }
-        vis_rows: Dict[float, List[torch.Tensor]] = {t: [] for t in regen_t_values}
-        vis_seen: Dict[float, int] = {t: 0 for t in regen_t_values}
+        best_cfg = getattr(cfg.evaluation, "best", SimpleNamespace())
+        best_enabled = bool(getattr(best_cfg, "enabled", True))
+        best_save_overall = bool(getattr(best_cfg, "save_overall", False))
+        best_min_improvement = float(getattr(best_cfg, "min_improvement", 1e-6))
+        best_posthoc_lpips_w = float(getattr(best_cfg, "posthoc_lpips_weight", 10.0))
+        best_regen_clip_w = float(getattr(best_cfg, "regen_clip_weight", 0.5))
+        best_regen_div_w = float(getattr(best_cfg, "regen_div_weight", 0.3))
+        best_overall_w_posthoc = float(getattr(best_cfg, "overall_posthoc_weight", 0.5))
+        best_overall_w_regen = float(getattr(best_cfg, "overall_regen_weight", 0.5))
 
-        for _batch_i, batch in enumerate(loader):
-            global_idx, images, _labels = batch
-            x = images.to(device=device, non_blocking=True)
-            bsz = int(x.shape[0])
-            sem_cond_batch = get_sem_cond_batch(global_idx, x)
-            edge_map_batch = (
-                sobel_edge_map(x, blur_sigma=edge_blur_sigma, threshold=edge_threshold) if enable_edge else None
-            )
+        posthoc_best_candidate = None
+        regen_best_candidate = None
 
-            with torch.no_grad():
-                dino_x_batch = _mean_feature_from_tokens(dino_metric.encode(x, amp_dtype=torch.bfloat16))
-                clip_x_batch = clip_encoder.encode(x) if clip_encoder is not None else None
+        def get_sem_cond_batch(global_indices: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            if cache is not None:
+                idx = global_indices.to(device="cpu", dtype=torch.int64)
+                sem = cache.get_batch(split=str(cfg.dataset.val_split), indices=idx, device=device)
+                return sem.to(dtype=torch.float32)
+            assert cond_encoder is not None
+            return cond_encoder.encode(x, amp_dtype=torch.bfloat16).to(dtype=torch.float32)
 
-            for t_val in regen_t_values:
-                for bi in range(bsz):
-                    x_b = x[bi : bi + 1]
-                    sem_b = sem_cond_batch[bi : bi + 1]
-                    edge_b = edge_map_batch[bi : bi + 1] if edge_map_batch is not None else None
-                    dino_x = dino_x_batch[bi : bi + 1]
-                    clip_x = clip_x_batch[bi : bi + 1] if clip_x_batch is not None else None
-                    sample_key = int(global_idx[bi].item())
+        for sweep in posthoc_sweeps:
+            tag = sweep.tag
+            safe_tag = sweep.safe_tag
+            acc = {t: {"psnr": [], "ssim": [], "lpips": []} for t in posthoc_t_values}
+            vis_rows: Dict[float, List[torch.Tensor]] = {t: [] for t in posthoc_t_values}
+            vis_seen: Dict[float, int] = {t: 0 for t in posthoc_t_values}
 
-                    outs = []
-                    dino_feats = []
-                    z_t_vis_ref: Optional[torch.Tensor] = None
-                    for m in range(regen_num_variants):
+            for _batch_i, batch in enumerate(loader):
+                global_idx, images, _labels = batch
+                x = images.to(device=device, non_blocking=True)
+                bsz = int(x.shape[0])
+                sem_cond_batch = get_sem_cond_batch(global_idx, x)
+                edge_map_batch = (
+                    sobel_edge_map(x, blur_sigma=edge_blur_sigma, threshold=edge_threshold) if enable_edge else None
+                )
+
+                for t_val in posthoc_t_values:
+                    for bi in range(bsz):
+                        x_b = x[bi : bi + 1]
+                        sem_b = sem_cond_batch[bi : bi + 1]
+                        edge_b = edge_map_batch[bi : bi + 1] if edge_map_batch is not None else None
+                        sample_key = int(global_idx[bi].item())
+
                         g = torch.Generator(device=device)
-                        g.manual_seed(_make_seed(int(cfg.evaluation.seed), sample_key, t_val, m))
+                        g.manual_seed(_make_seed(int(cfg.evaluation.seed), sample_key, t_val, 0))
                         eps = torch.randn(x_b.shape, device=device, dtype=x_b.dtype, generator=g)
                         z_t = (1.0 - t_val) * x_b + t_val * (noise_scale * eps)
-                        if z_t_vis_ref is None:
-                            z_t_vis_ref = z_t.clamp(-1.0, 1.0)
                         x_hat = _run_guided(
                             model=model,
                             z_start=z_t,
@@ -737,244 +596,409 @@ def run_eval(args):
                             t_max=sweep.t_max,
                             t_eps=t_eps,
                         ).clamp(-1.0, 1.0)
-                        outs.append(x_hat)
 
-                        with torch.no_grad():
-                            d_feat = _mean_feature_from_tokens(dino_metric.encode(x_hat, amp_dtype=torch.bfloat16))
-                            dino_feats.append(d_feat)
-                            dino_sim = float(_normed_cosine(d_feat, dino_x).mean().item())
-                            acc[t_val]["dino_sim"].append(dino_sim)
+                        x01 = _to_01(x_b)
+                        y01 = _to_01(x_hat)
+                        mse = torch.mean((x01 - y01) ** 2, dim=(1, 2, 3))
+                        psnr = float(_psnr_from_mse(mse).mean().item())
+                        ssim = float(ssim_metric(x01, y01).mean().item())
+                        lp = float(lpips_metric(x_hat, x_b).mean().item())
 
-                            if clip_encoder is not None and clip_x is not None:
-                                c_feat = clip_encoder.encode(x_hat)
-                                clip_sim = float(_normed_cosine(c_feat, clip_x).mean().item())
-                                acc[t_val]["clip_sim"].append(clip_sim)
+                        acc[t_val]["psnr"].append(psnr)
+                        acc[t_val]["ssim"].append(ssim)
+                        acc[t_val]["lpips"].append(lp)
 
-                    # Pairwise diversity on generated variants for the same source image.
-                    div_lpips = []
-                    div_dino = []
-                    for i, j in _pairwise_indices(len(outs)):
-                        lp = float(lpips_metric(outs[i], outs[j]).mean().item())
-                        div_lpips.append(lp)
-                        di = 1.0 - float(_normed_cosine(dino_feats[i], dino_feats[j]).mean().item())
-                        div_dino.append(di)
-                    if div_lpips:
-                        acc[t_val]["div_lpips"].append(float(np.mean(div_lpips)))
-                    if div_dino:
-                        acc[t_val]["div_dino"].append(float(np.mean(div_dino)))
+                        if (save_vis or vis_to_tb) and vis_seen[t_val] < vis_num_images:
+                            edge_vis = torch.zeros_like(x_b)
+                            if edge_b is not None:
+                                edge_vis = edge_b.repeat(1, 3, 1, 1) * 2.0 - 1.0
+                            z_t_vis = z_t.clamp(-1.0, 1.0)
+                            vis_rows[t_val].extend(
+                                [
+                                    x_b[0].detach().cpu(),
+                                    z_t_vis[0].detach().cpu(),
+                                    edge_vis[0].detach().cpu(),
+                                    x_hat[0].detach().cpu(),
+                                ]
+                            )
+                            vis_seen[t_val] += 1
 
-                    if (save_vis or vis_to_tb) and vis_seen[t_val] < vis_num_images:
-                        edge_vis = torch.zeros_like(x_b)
-                        if edge_b is not None:
-                            edge_vis = edge_b.repeat(1, 3, 1, 1) * 2.0 - 1.0
-                        vis_rows[t_val].append(x_b[0].detach().cpu())
-                        if z_t_vis_ref is not None:
-                            vis_rows[t_val].append(z_t_vis_ref[0].detach().cpu())
-                        vis_rows[t_val].append(edge_vis[0].detach().cpu())
-                        for out_img in outs[: max(1, vis_regen_variants)]:
-                            vis_rows[t_val].append(out_img[0].detach().cpu())
-                        vis_seen[t_val] += 1
+            metrics_to_tb = {}
+            posthoc_out = {}
+            all_psnr, all_ssim, all_lpips = [], [], []
+            for t_val in posthoc_t_values:
+                t_str = f"{t_val:.2f}"
+                mean_psnr = float(np.mean(acc[t_val]["psnr"])) if acc[t_val]["psnr"] else float("nan")
+                mean_ssim = float(np.mean(acc[t_val]["ssim"])) if acc[t_val]["ssim"] else float("nan")
+                mean_lp = float(np.mean(acc[t_val]["lpips"])) if acc[t_val]["lpips"] else float("nan")
+                posthoc_out[t_str] = {"psnr": mean_psnr, "ssim": mean_ssim, "lpips": mean_lp}
+                metrics_to_tb[f"eval/posthoc/psnr_t{t_str}/mean/{tag}"] = mean_psnr
+                metrics_to_tb[f"eval/posthoc/ssim_t{t_str}/mean/{tag}"] = mean_ssim
+                metrics_to_tb[f"eval/posthoc/lpips_t{t_str}/mean/{tag}"] = mean_lp
+                all_psnr.append(mean_psnr)
+                all_ssim.append(mean_ssim)
+                all_lpips.append(mean_lp)
 
-        metrics_to_tb = {}
-        regen_out = {}
-        all_dino, all_clip, all_divlp = [], [], []
+                if save_vis or vis_to_tb:
+                    out_path = os.path.join(eval_root, "vis", "posthoc", f"{safe_tag}_t{t_str}.png")
+                    grid = _make_vis_grid(vis_rows[t_val], nrow=4)
+                    if save_vis:
+                        _save_grid(grid, out_path=out_path)
+                    if vis_to_tb and grid is not None:
+                        writer.add_image(f"eval/vis/posthoc/t{t_str}/{safe_tag}", grid, global_step)
 
-        for t_val in regen_t_values:
-            t_str = f"{t_val:.2f}"
-            mean_dino = float(np.mean(acc[t_val]["dino_sim"])) if acc[t_val]["dino_sim"] else float("nan")
-            mean_clip = float(np.mean(acc[t_val]["clip_sim"])) if acc[t_val]["clip_sim"] else float("nan")
-            mean_div_lpips = float(np.mean(acc[t_val]["div_lpips"])) if acc[t_val]["div_lpips"] else float("nan")
-            mean_div_dino = float(np.mean(acc[t_val]["div_dino"])) if acc[t_val]["div_dino"] else float("nan")
-
-            regen_out[t_str] = {
-                "dino_sim": mean_dino,
-                "clip_sim": mean_clip,
-                "div_lpips": mean_div_lpips,
-                "div_dino": mean_div_dino,
-            }
-            metrics_to_tb[f"eval/regen/dino_sim_t{t_str}/mean/{tag}"] = mean_dino
-            metrics_to_tb[f"eval/regen/div_lpips_t{t_str}/mean/{tag}"] = mean_div_lpips
-            metrics_to_tb[f"eval/regen/div_dino_t{t_str}/mean/{tag}"] = mean_div_dino
-            if not math.isnan(mean_clip):
-                metrics_to_tb[f"eval/regen/clip_sim_t{t_str}/mean/{tag}"] = mean_clip
-
-            all_dino.append(mean_dino)
-            all_divlp.append(mean_div_lpips)
-            if not math.isnan(mean_clip):
-                all_clip.append(mean_clip)
-
-            if save_vis or vis_to_tb:
-                nrow = 3 + max(1, vis_regen_variants)
-                out_path = os.path.join(eval_root, "vis", "regen", f"{safe_tag}_t{t_str}.png")
-                grid = _make_vis_grid(vis_rows[t_val], nrow=nrow)
-                if save_vis:
-                    _save_grid(grid, out_path=out_path)
-                if vis_to_tb and grid is not None:
-                    writer.add_image(f"eval/vis/regen/t{t_str}/{safe_tag}", grid, global_step)
-
-        mean_dino_all = float(np.mean(all_dino))
-        mean_divlp_all = float(np.mean(all_divlp))
-        metrics_to_tb[f"eval/regen/dino_sim/mean_over_t/{tag}"] = mean_dino_all
-        metrics_to_tb[f"eval/regen/div_lpips/mean_over_t/{tag}"] = mean_divlp_all
-        if all_clip:
-            metrics_to_tb[f"eval/regen/clip_sim/mean_over_t/{tag}"] = float(np.mean(all_clip))
-        pareto = mean_dino_all - (1.0 / max(mean_divlp_all, 1e-6))
-        metrics_to_tb[f"eval/regen/pareto/{tag}"] = float(pareto)
-        _write_scalars(writer, global_step, metrics_to_tb)
-        score_regen = _score_regen(
-            {
-                "dino_sim": mean_dino_all,
-                "clip_sim": float(np.mean(all_clip)) if all_clip else float("nan"),
-                "div_lpips": mean_divlp_all,
-            },
-            clip_weight=best_regen_clip_w,
-            div_weight=best_regen_div_w,
-        )
-
-        results["regen"][tag] = {
-            "sweep": {"num_steps": sweep.num_steps, "omega": sweep.omega, "t_min": sweep.t_min, "t_max": sweep.t_max},
-            "per_t": regen_out,
-            "mean_over_t": {
-                "dino_sim": mean_dino_all,
-                "clip_sim": float(np.mean(all_clip)) if all_clip else float("nan"),
-                "div_lpips": mean_divlp_all,
-                "pareto": float(pareto),
-            },
-            "score_regen": float(score_regen),
-        }
-        cand = {
-            "tag": tag,
-            "score": float(score_regen),
-            "infer_cfg": {
-                "omega": float(sweep.omega),
-                "t_min": float(sweep.t_min),
-                "t_max": float(sweep.t_max),
-                "num_steps": int(sweep.num_steps),
-                "t_eps": float(t_eps),
-            },
-            "metrics": results["regen"][tag]["mean_over_t"],
-        }
-        if (regen_best_candidate is None) or (cand["score"] > regen_best_candidate["score"]):
-            regen_best_candidate = cand
-        print(f"[regen] done {tag}")
-
-    if best_enabled:
-        run_meta = {
-            "config": os.path.abspath(args.config),
-            "source_checkpoint": os.path.abspath(args.checkpoint),
-            "ckpt_step": int(global_step),
-            "ckpt_epoch": int(epoch_from_ckpt),
-            "evaluated_at": datetime.now().isoformat(timespec="seconds"),
-            "eval": {
-                "split": str(cfg.dataset.val_split),
-                "n": int(max_samples),
-                "seed": int(cfg.evaluation.seed),
-                "posthoc_t_values": posthoc_t_values,
-                "regen_t_values": regen_t_values,
-                "regen_num_variants": int(regen_num_variants),
-            },
-        }
-
-        if posthoc_best_candidate is not None:
-            payload = {
-                "best_type": "posthoc",
-                "score_name": "S_posthoc = PSNR_mean - lambda * LPIPS_mean",
-                "score_weights": {"posthoc_lpips_weight": best_posthoc_lpips_w},
-                "score": float(posthoc_best_candidate["score"]),
-                "metrics": posthoc_best_candidate["metrics"],
-                "infer_cfg": posthoc_best_candidate["infer_cfg"],
-                "sweep_tag": posthoc_best_candidate["tag"],
-                **run_meta,
-            }
-            improved, best_record = _save_best_if_improved(
-                name="posthoc",
-                score=float(posthoc_best_candidate["score"]),
-                payload=payload,
-                source_checkpoint=args.checkpoint,
-                ckpt_dir=checkpoints_dir,
-                min_improvement=best_min_improvement,
-            )
-            writer.add_scalar("best/posthoc/score", float(best_record.get("score", float("nan"))), int(global_step))
-            writer.add_scalar("best/posthoc/step", int(best_record.get("ckpt_step", global_step)), int(global_step))
-            if improved:
-                writer.add_text("best/posthoc/infer_cfg", json.dumps(posthoc_best_candidate["infer_cfg"], ensure_ascii=False), int(global_step))
-                print(f"[best] updated best_posthoc.pt score={posthoc_best_candidate['score']:.6f}")
-
-        if regen_best_candidate is not None:
-            payload = {
-                "best_type": "regen",
-                "score_name": "S_regen = DINO_sim + alpha * CLIP_sim + beta * DIV_LPIPS",
-                "score_weights": {
-                    "regen_clip_weight": best_regen_clip_w,
-                    "regen_div_weight": best_regen_div_w,
+            metrics_to_tb[f"eval/posthoc/psnr/mean_over_t/{tag}"] = float(np.mean(all_psnr))
+            metrics_to_tb[f"eval/posthoc/ssim/mean_over_t/{tag}"] = float(np.mean(all_ssim))
+            metrics_to_tb[f"eval/posthoc/lpips/mean_over_t/{tag}"] = float(np.mean(all_lpips))
+            _write_scalars(writer, global_step, metrics_to_tb)
+            score_posthoc = _score_posthoc(
+                {
+                    "psnr": metrics_to_tb[f"eval/posthoc/psnr/mean_over_t/{tag}"],
+                    "lpips": metrics_to_tb[f"eval/posthoc/lpips/mean_over_t/{tag}"],
                 },
-                "score": float(regen_best_candidate["score"]),
-                "metrics": regen_best_candidate["metrics"],
-                "infer_cfg": regen_best_candidate["infer_cfg"],
-                "sweep_tag": regen_best_candidate["tag"],
-                **run_meta,
+                lpips_weight=best_posthoc_lpips_w,
+            )
+            results["posthoc"][tag] = {
+                "sweep": {"num_steps": sweep.num_steps, "omega": sweep.omega, "t_min": sweep.t_min, "t_max": sweep.t_max},
+                "per_t": posthoc_out,
+                "mean_over_t": {
+                    "psnr": metrics_to_tb[f"eval/posthoc/psnr/mean_over_t/{tag}"],
+                    "ssim": metrics_to_tb[f"eval/posthoc/ssim/mean_over_t/{tag}"],
+                    "lpips": metrics_to_tb[f"eval/posthoc/lpips/mean_over_t/{tag}"],
+                },
+                "score_posthoc": float(score_posthoc),
             }
-            improved, best_record = _save_best_if_improved(
-                name="regen",
-                score=float(regen_best_candidate["score"]),
-                payload=payload,
-                source_checkpoint=args.checkpoint,
-                ckpt_dir=checkpoints_dir,
-                min_improvement=best_min_improvement,
-            )
-            writer.add_scalar("best/regen/score", float(best_record.get("score", float("nan"))), int(global_step))
-            writer.add_scalar("best/regen/step", int(best_record.get("ckpt_step", global_step)), int(global_step))
-            if improved:
-                writer.add_text("best/regen/infer_cfg", json.dumps(regen_best_candidate["infer_cfg"], ensure_ascii=False), int(global_step))
-                print(f"[best] updated best_regen.pt score={regen_best_candidate['score']:.6f}")
-
-        if best_save_overall and (posthoc_best_candidate is not None) and (regen_best_candidate is not None):
-            overall_score = (
-                float(best_overall_w_posthoc) * float(posthoc_best_candidate["score"])
-                + float(best_overall_w_regen) * float(regen_best_candidate["score"])
-            )
-            payload = {
-                "best_type": "overall",
-                "score_name": "S_overall = w1 * S_posthoc + w2 * S_regen",
-                "score_weights": {
-                    "overall_posthoc_weight": best_overall_w_posthoc,
-                    "overall_regen_weight": best_overall_w_regen,
-                },
-                "score": float(overall_score),
-                "metrics": {
-                    "posthoc": posthoc_best_candidate["metrics"],
-                    "regen": regen_best_candidate["metrics"],
-                },
+            cand = {
+                "tag": tag,
+                "score": float(score_posthoc),
                 "infer_cfg": {
-                    "posthoc": posthoc_best_candidate["infer_cfg"],
-                    "regen": regen_best_candidate["infer_cfg"],
+                    "omega": float(sweep.omega),
+                    "t_min": float(sweep.t_min),
+                    "t_max": float(sweep.t_max),
+                    "num_steps": int(sweep.num_steps),
+                    "t_eps": float(t_eps),
                 },
-                "sweep_tag": {
-                    "posthoc": posthoc_best_candidate["tag"],
-                    "regen": regen_best_candidate["tag"],
-                },
-                **run_meta,
+                "metrics": results["posthoc"][tag]["mean_over_t"],
             }
-            improved, best_record = _save_best_if_improved(
-                name="overall",
-                score=float(overall_score),
-                payload=payload,
-                source_checkpoint=args.checkpoint,
-                ckpt_dir=checkpoints_dir,
-                min_improvement=best_min_improvement,
-            )
-            writer.add_scalar("best/overall/score", float(best_record.get("score", float("nan"))), int(global_step))
-            writer.add_scalar("best/overall/step", int(best_record.get("ckpt_step", global_step)), int(global_step))
-            if improved:
-                writer.add_text("best/overall/infer_cfg", json.dumps(payload["infer_cfg"], ensure_ascii=False), int(global_step))
-                print(f"[best] updated best_overall.pt score={overall_score:.6f}")
+            if (posthoc_best_candidate is None) or (cand["score"] > posthoc_best_candidate["score"]):
+                posthoc_best_candidate = cand
+            print(f"[posthoc] done {tag}")
 
-    summary_path = os.path.join(eval_root, "metrics_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    writer.close()
-    print(f"[done] Evaluation finished. Summary: {summary_path}")
-    print(f"[done] TensorBoard: {tb_dir}")
+        for sweep in regen_sweeps:
+            tag = sweep.tag
+            safe_tag = sweep.safe_tag
+            acc = {
+                t: {
+                    "dino_sim": [],
+                    "clip_sim": [],
+                    "div_lpips": [],
+                    "div_dino": [],
+                }
+                for t in regen_t_values
+            }
+            vis_rows: Dict[float, List[torch.Tensor]] = {t: [] for t in regen_t_values}
+            vis_seen: Dict[float, int] = {t: 0 for t in regen_t_values}
+
+            for _batch_i, batch in enumerate(loader):
+                global_idx, images, _labels = batch
+                x = images.to(device=device, non_blocking=True)
+                bsz = int(x.shape[0])
+                sem_cond_batch = get_sem_cond_batch(global_idx, x)
+                edge_map_batch = (
+                    sobel_edge_map(x, blur_sigma=edge_blur_sigma, threshold=edge_threshold) if enable_edge else None
+                )
+
+                with torch.no_grad():
+                    dino_x_batch = _mean_feature_from_tokens(dino_metric.encode(x, amp_dtype=torch.bfloat16))
+                    clip_x_batch = clip_encoder.encode(x) if clip_encoder is not None else None
+
+                for t_val in regen_t_values:
+                    for bi in range(bsz):
+                        x_b = x[bi : bi + 1]
+                        sem_b = sem_cond_batch[bi : bi + 1]
+                        edge_b = edge_map_batch[bi : bi + 1] if edge_map_batch is not None else None
+                        dino_x = dino_x_batch[bi : bi + 1]
+                        clip_x = clip_x_batch[bi : bi + 1] if clip_x_batch is not None else None
+                        sample_key = int(global_idx[bi].item())
+
+                        outs = []
+                        dino_feats = []
+                        z_t_vis_ref: Optional[torch.Tensor] = None
+                        for m in range(regen_num_variants):
+                            g = torch.Generator(device=device)
+                            g.manual_seed(_make_seed(int(cfg.evaluation.seed), sample_key, t_val, m))
+                            eps = torch.randn(x_b.shape, device=device, dtype=x_b.dtype, generator=g)
+                            z_t = (1.0 - t_val) * x_b + t_val * (noise_scale * eps)
+                            if z_t_vis_ref is None:
+                                z_t_vis_ref = z_t.clamp(-1.0, 1.0)
+                            x_hat = _run_guided(
+                                model=model,
+                                z_start=z_t,
+                                t_start=t_val,
+                                r_end=0.0,
+                                num_steps=sweep.num_steps,
+                                sem_cond=sem_b,
+                                edge_map=edge_b,
+                                omega=sweep.omega,
+                                t_min=sweep.t_min,
+                                t_max=sweep.t_max,
+                                t_eps=t_eps,
+                            ).clamp(-1.0, 1.0)
+                            outs.append(x_hat)
+
+                            with torch.no_grad():
+                                d_feat = _mean_feature_from_tokens(dino_metric.encode(x_hat, amp_dtype=torch.bfloat16))
+                                dino_feats.append(d_feat)
+                                dino_sim = float(_normed_cosine(d_feat, dino_x).mean().item())
+                                acc[t_val]["dino_sim"].append(dino_sim)
+
+                                if clip_encoder is not None and clip_x is not None:
+                                    c_feat = clip_encoder.encode(x_hat)
+                                    clip_sim = float(_normed_cosine(c_feat, clip_x).mean().item())
+                                    acc[t_val]["clip_sim"].append(clip_sim)
+
+                        div_lpips = []
+                        div_dino = []
+                        for i, j in _pairwise_indices(len(outs)):
+                            lp = float(lpips_metric(outs[i], outs[j]).mean().item())
+                            div_lpips.append(lp)
+                            di = 1.0 - float(_normed_cosine(dino_feats[i], dino_feats[j]).mean().item())
+                            div_dino.append(di)
+                        if div_lpips:
+                            acc[t_val]["div_lpips"].append(float(np.mean(div_lpips)))
+                        if div_dino:
+                            acc[t_val]["div_dino"].append(float(np.mean(div_dino)))
+
+                        if (save_vis or vis_to_tb) and vis_seen[t_val] < vis_num_images:
+                            edge_vis = torch.zeros_like(x_b)
+                            if edge_b is not None:
+                                edge_vis = edge_b.repeat(1, 3, 1, 1) * 2.0 - 1.0
+                            vis_rows[t_val].append(x_b[0].detach().cpu())
+                            if z_t_vis_ref is not None:
+                                vis_rows[t_val].append(z_t_vis_ref[0].detach().cpu())
+                            vis_rows[t_val].append(edge_vis[0].detach().cpu())
+                            for out_img in outs[: max(1, vis_regen_variants)]:
+                                vis_rows[t_val].append(out_img[0].detach().cpu())
+                            vis_seen[t_val] += 1
+
+            metrics_to_tb = {}
+            regen_out = {}
+            all_dino, all_clip, all_divlp = [], [], []
+            for t_val in regen_t_values:
+                t_str = f"{t_val:.2f}"
+                mean_dino = float(np.mean(acc[t_val]["dino_sim"])) if acc[t_val]["dino_sim"] else float("nan")
+                mean_clip = float(np.mean(acc[t_val]["clip_sim"])) if acc[t_val]["clip_sim"] else float("nan")
+                mean_div_lpips = float(np.mean(acc[t_val]["div_lpips"])) if acc[t_val]["div_lpips"] else float("nan")
+                mean_div_dino = float(np.mean(acc[t_val]["div_dino"])) if acc[t_val]["div_dino"] else float("nan")
+
+                regen_out[t_str] = {
+                    "dino_sim": mean_dino,
+                    "clip_sim": mean_clip,
+                    "div_lpips": mean_div_lpips,
+                    "div_dino": mean_div_dino,
+                }
+                metrics_to_tb[f"eval/regen/dino_sim_t{t_str}/mean/{tag}"] = mean_dino
+                metrics_to_tb[f"eval/regen/div_lpips_t{t_str}/mean/{tag}"] = mean_div_lpips
+                metrics_to_tb[f"eval/regen/div_dino_t{t_str}/mean/{tag}"] = mean_div_dino
+                if not math.isnan(mean_clip):
+                    metrics_to_tb[f"eval/regen/clip_sim_t{t_str}/mean/{tag}"] = mean_clip
+
+                all_dino.append(mean_dino)
+                all_divlp.append(mean_div_lpips)
+                if not math.isnan(mean_clip):
+                    all_clip.append(mean_clip)
+
+                if save_vis or vis_to_tb:
+                    nrow = 3 + max(1, vis_regen_variants)
+                    out_path = os.path.join(eval_root, "vis", "regen", f"{safe_tag}_t{t_str}.png")
+                    grid = _make_vis_grid(vis_rows[t_val], nrow=nrow)
+                    if save_vis:
+                        _save_grid(grid, out_path=out_path)
+                    if vis_to_tb and grid is not None:
+                        writer.add_image(f"eval/vis/regen/t{t_str}/{safe_tag}", grid, global_step)
+
+            mean_dino_all = float(np.mean(all_dino))
+            mean_divlp_all = float(np.mean(all_divlp))
+            metrics_to_tb[f"eval/regen/dino_sim/mean_over_t/{tag}"] = mean_dino_all
+            metrics_to_tb[f"eval/regen/div_lpips/mean_over_t/{tag}"] = mean_divlp_all
+            if all_clip:
+                metrics_to_tb[f"eval/regen/clip_sim/mean_over_t/{tag}"] = float(np.mean(all_clip))
+            pareto = mean_dino_all - (1.0 / max(mean_divlp_all, 1e-6))
+            metrics_to_tb[f"eval/regen/pareto/{tag}"] = float(pareto)
+            _write_scalars(writer, global_step, metrics_to_tb)
+            score_regen = _score_regen(
+                {
+                    "dino_sim": mean_dino_all,
+                    "clip_sim": float(np.mean(all_clip)) if all_clip else float("nan"),
+                    "div_lpips": mean_divlp_all,
+                },
+                clip_weight=best_regen_clip_w,
+                div_weight=best_regen_div_w,
+            )
+
+            results["regen"][tag] = {
+                "sweep": {"num_steps": sweep.num_steps, "omega": sweep.omega, "t_min": sweep.t_min, "t_max": sweep.t_max},
+                "per_t": regen_out,
+                "mean_over_t": {
+                    "dino_sim": mean_dino_all,
+                    "clip_sim": float(np.mean(all_clip)) if all_clip else float("nan"),
+                    "div_lpips": mean_divlp_all,
+                    "pareto": float(pareto),
+                },
+                "score_regen": float(score_regen),
+            }
+            cand = {
+                "tag": tag,
+                "score": float(score_regen),
+                "infer_cfg": {
+                    "omega": float(sweep.omega),
+                    "t_min": float(sweep.t_min),
+                    "t_max": float(sweep.t_max),
+                    "num_steps": int(sweep.num_steps),
+                    "t_eps": float(t_eps),
+                },
+                "metrics": results["regen"][tag]["mean_over_t"],
+            }
+            if (regen_best_candidate is None) or (cand["score"] > regen_best_candidate["score"]):
+                regen_best_candidate = cand
+            print(f"[regen] done {tag}")
+
+        if best_enabled:
+            run_meta = {
+                "config": os.path.abspath(args.config),
+                "source_checkpoint": os.path.abspath(args.checkpoint),
+                "ckpt_step": int(global_step),
+                "ckpt_epoch": int(epoch_from_ckpt),
+                "evaluated_at": datetime.now().isoformat(timespec="seconds"),
+                "eval": {
+                    "split": str(cfg.dataset.val_split),
+                    "n": int(max_samples),
+                    "seed": int(cfg.evaluation.seed),
+                    "posthoc_t_values": posthoc_t_values,
+                    "regen_t_values": regen_t_values,
+                    "regen_num_variants": int(regen_num_variants),
+                },
+            }
+
+            if posthoc_best_candidate is not None:
+                payload = {
+                    "best_type": "posthoc",
+                    "score_name": "S_posthoc = PSNR_mean - lambda * LPIPS_mean",
+                    "score_weights": {"posthoc_lpips_weight": best_posthoc_lpips_w},
+                    "score": float(posthoc_best_candidate["score"]),
+                    "metrics": posthoc_best_candidate["metrics"],
+                    "infer_cfg": posthoc_best_candidate["infer_cfg"],
+                    "sweep_tag": posthoc_best_candidate["tag"],
+                    **run_meta,
+                }
+                improved, best_record = _save_best_if_improved(
+                    name="posthoc",
+                    score=float(posthoc_best_candidate["score"]),
+                    payload=payload,
+                    source_checkpoint=args.checkpoint,
+                    ckpt_dir=checkpoints_dir,
+                    min_improvement=best_min_improvement,
+                )
+                writer.add_scalar("best/posthoc/score", float(best_record.get("score", float("nan"))), int(global_step))
+                writer.add_scalar("best/posthoc/step", int(best_record.get("ckpt_step", global_step)), int(global_step))
+                if improved:
+                    writer.add_text("best/posthoc/infer_cfg", json.dumps(posthoc_best_candidate["infer_cfg"], ensure_ascii=False), int(global_step))
+                    print(f"[best] updated best_posthoc.pt score={posthoc_best_candidate['score']:.6f}")
+
+            if regen_best_candidate is not None:
+                payload = {
+                    "best_type": "regen",
+                    "score_name": "S_regen = DINO_sim + alpha * CLIP_sim + beta * DIV_LPIPS",
+                    "score_weights": {
+                        "regen_clip_weight": best_regen_clip_w,
+                        "regen_div_weight": best_regen_div_w,
+                    },
+                    "score": float(regen_best_candidate["score"]),
+                    "metrics": regen_best_candidate["metrics"],
+                    "infer_cfg": regen_best_candidate["infer_cfg"],
+                    "sweep_tag": regen_best_candidate["tag"],
+                    **run_meta,
+                }
+                improved, best_record = _save_best_if_improved(
+                    name="regen",
+                    score=float(regen_best_candidate["score"]),
+                    payload=payload,
+                    source_checkpoint=args.checkpoint,
+                    ckpt_dir=checkpoints_dir,
+                    min_improvement=best_min_improvement,
+                )
+                writer.add_scalar("best/regen/score", float(best_record.get("score", float("nan"))), int(global_step))
+                writer.add_scalar("best/regen/step", int(best_record.get("ckpt_step", global_step)), int(global_step))
+                if improved:
+                    writer.add_text("best/regen/infer_cfg", json.dumps(regen_best_candidate["infer_cfg"], ensure_ascii=False), int(global_step))
+                    print(f"[best] updated best_regen.pt score={regen_best_candidate['score']:.6f}")
+
+            if best_save_overall and (posthoc_best_candidate is not None) and (regen_best_candidate is not None):
+                overall_score = (
+                    float(best_overall_w_posthoc) * float(posthoc_best_candidate["score"])
+                    + float(best_overall_w_regen) * float(regen_best_candidate["score"])
+                )
+                payload = {
+                    "best_type": "overall",
+                    "score_name": "S_overall = w1 * S_posthoc + w2 * S_regen",
+                    "score_weights": {
+                        "overall_posthoc_weight": best_overall_w_posthoc,
+                        "overall_regen_weight": best_overall_w_regen,
+                    },
+                    "score": float(overall_score),
+                    "metrics": {
+                        "posthoc": posthoc_best_candidate["metrics"],
+                        "regen": regen_best_candidate["metrics"],
+                    },
+                    "infer_cfg": {
+                        "posthoc": posthoc_best_candidate["infer_cfg"],
+                        "regen": regen_best_candidate["infer_cfg"],
+                    },
+                    "sweep_tag": {
+                        "posthoc": posthoc_best_candidate["tag"],
+                        "regen": regen_best_candidate["tag"],
+                    },
+                    **run_meta,
+                }
+                improved, best_record = _save_best_if_improved(
+                    name="overall",
+                    score=float(overall_score),
+                    payload=payload,
+                    source_checkpoint=args.checkpoint,
+                    ckpt_dir=checkpoints_dir,
+                    min_improvement=best_min_improvement,
+                )
+                writer.add_scalar("best/overall/score", float(best_record.get("score", float("nan"))), int(global_step))
+                writer.add_scalar("best/overall/step", int(best_record.get("ckpt_step", global_step)), int(global_step))
+                if improved:
+                    writer.add_text("best/overall/infer_cfg", json.dumps(payload["infer_cfg"], ensure_ascii=False), int(global_step))
+                    print(f"[best] updated best_overall.pt score={overall_score:.6f}")
+
+        summary_path = os.path.join(eval_root, "metrics_summary.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        print(f"[done] Evaluation finished. Summary: {summary_path}")
+        print(f"[done] TensorBoard: {tb_dir}")
+    finally:
+        if writer is not None:
+            writer.close()
+        if loader is not None:
+            loader_iter = getattr(loader, "_iterator", None)
+            if loader_iter is not None and hasattr(loader_iter, "_shutdown_workers"):
+                loader_iter._shutdown_workers()
+        del loader
+        del writer
+        del model
+        del cache
+        del cond_encoder
+        del dino_metric
+        del lpips_metric
+        del ssim_metric
+        del clip_encoder
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
 
 
 def main():

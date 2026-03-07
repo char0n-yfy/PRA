@@ -19,6 +19,21 @@ def setup_logger(level: int = logging.INFO):
     logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(message)s")
 
 
+def attach_file_logger(log_file: str, level: int = logging.INFO):
+    if not log_file:
+        return
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    root = logging.getLogger()
+    abs_path = os.path.abspath(log_file)
+    for handler in root.handlers:
+        if isinstance(handler, logging.FileHandler) and os.path.abspath(handler.baseFilename) == abs_path:
+            return
+    file_handler = logging.FileHandler(abs_path, mode="a", encoding="utf-8")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    root.addHandler(file_handler)
+
+
 def rank0_info(msg: str):
     if is_main_process():
         logging.info(msg)

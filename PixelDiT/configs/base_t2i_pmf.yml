@@ -100,6 +100,9 @@ evaluation:
   enabled: true
   run_every_n_epochs: 1
   fail_on_error: false
+  # Force single-process dataloader inside in-training epoch-end eval to avoid
+  # semaphore/worker cleanup crashes under torchrun + Python 3.12.
+  epoch_end_num_workers: 0
   epoch_max_samples: 64
   max_samples: 1000
   batch_size: 20
@@ -156,3 +159,12 @@ checkpoint:
 ddp:
   backend: nccl
   find_unused_parameters: false
+
+resume:
+  enabled: true
+  checkpoint: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf/20260306-111136/checkpoints/checkpoint_step_00071174.pt
+  workdir: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf/20260306-111136
+  strict_model: true
+  optimizer: true
+  scaler: true
+  rng_state: true

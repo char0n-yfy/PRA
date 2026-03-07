@@ -17,7 +17,7 @@ if __package__ is None or __package__ == "":
         sys.path.insert(0, repo_root)
 
 from PixelDiT.train import run_train, smoke_test_forward
-from PixelDiT.utils.logging import rank0_info, setup_logger
+from PixelDiT.utils.logging import attach_file_logger, rank0_info, setup_logger
 
 
 def _load_yaml(path: str) -> dict:
@@ -33,6 +33,13 @@ def _default_workdir(config_path: str) -> str:
     if not run_name.lower().startswith("pixeldit"):
         run_name = f"PixelDiT_{run_name}"
     return os.path.join("output", run_name)
+
+
+def _workdir_from_checkpoint(ckpt_path: str) -> str:
+    p = Path(ckpt_path).resolve()
+    if p.parent.name == "checkpoints":
+        return str(p.parent.parent)
+    return str(p.parent)
 
 
 def _timestamped_dir(base: str) -> str:
@@ -132,6 +139,10 @@ def main():
 
     setup_logger()
     cfg = _load_yaml(args.config)
+    resume_cfg = cfg.get("resume", {}) if isinstance(cfg, dict) else {}
+    resume_enabled = bool(resume_cfg.get("enabled", False))
+    resume_ckpt = str(resume_cfg.get("checkpoint", "")).strip()
+    resume_workdir = str(resume_cfg.get("workdir", "")).strip()
 
     workdir = None
     base_workdir = None
@@ -141,11 +152,19 @@ def main():
             rank0_info(f"Smoke forward passed: {out}")
             return
 
-        base_workdir = args.workdir.strip() if args.workdir.strip() else _default_workdir(args.config)
-        base_workdir = os.path.abspath(base_workdir)
-        workdir = _resolve_workdir_for_launch(base_workdir)
+        if resume_enabled:
+            if resume_ckpt == "":
+                raise ValueError("resume.enabled=true requires resume.checkpoint")
+            chosen_workdir = args.workdir.strip() or resume_workdir or _workdir_from_checkpoint(resume_ckpt)
+            workdir = os.path.abspath(chosen_workdir)
+            base_workdir = workdir
+        else:
+            base_workdir = args.workdir.strip() if args.workdir.strip() else _default_workdir(args.config)
+            base_workdir = os.path.abspath(base_workdir)
+            workdir = _resolve_workdir_for_launch(base_workdir)
 
         if _env_rank() == 0:
+            attach_file_logger(os.path.join(workdir, "tensorboard", "train.log"))
             _save_used_config(cfg, args.config, workdir)
         rank0_info(f"Config loaded from: {args.config}")
         rank0_info(f"Workdir: {workdir}")

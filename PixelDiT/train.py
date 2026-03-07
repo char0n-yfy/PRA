@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -48,6 +49,30 @@ except Exception:  # pragma: no cover
 class TrainState:
     epoch: int
     step: int
+
+
+def _capture_rng_state() -> dict:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict):
+    if not isinstance(state, dict):
+        return
+    if state.get("python") is not None:
+        random.setstate(state["python"])
+    if state.get("numpy") is not None:
+        np.random.set_state(state["numpy"])
+    if state.get("torch") is not None:
+        torch.random.set_rng_state(state["torch"])
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 def _as_namespace(obj):
@@ -225,6 +250,7 @@ def _save_checkpoint(workdir: str, state: TrainState, model, optimizer, scaler, 
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict() if scaler is not None else None,
+            "rng_state": _capture_rng_state(),
         },
         path,
     )
@@ -279,6 +305,70 @@ def _save_topk_train_loss(
             os.remove(stale)
 
     return entries
+
+
+def _load_topk_train_loss_entries(workdir: str, top_k: int = 1) -> List[dict]:
+    out_dir = os.path.join(workdir, "best_checkpoints")
+    if not os.path.isdir(out_dir):
+        return []
+
+    entries: List[dict] = []
+    for i in range(1, int(top_k) + 1):
+        path = os.path.join(out_dir, f"checkpoint_best_train_loss_rank{i}.pt")
+        if not os.path.isfile(path):
+            continue
+        ckpt = torch.load(path, map_location="cpu")
+        if not isinstance(ckpt, dict) or "model" not in ckpt:
+            continue
+        entries.append(
+            {
+                "metric_value": float(ckpt.get("metric_value", float("inf"))),
+                "epoch": int(ckpt.get("epoch", 0)),
+                "step": int(ckpt.get("step", 0)),
+                "state_dict": ckpt["model"],
+            }
+        )
+    return sorted(entries, key=lambda x: x["metric_value"])[: int(top_k)]
+
+
+def _load_training_checkpoint(
+    checkpoint_path: str,
+    model,
+    optimizer,
+    scaler,
+    strict_model: bool = True,
+    resume_optimizer: bool = True,
+    resume_scaler: bool = True,
+    resume_rng_state: bool = True,
+) -> dict:
+    # Full training checkpoints include optimizer/scaler/RNG states. Under PyTorch 2.6,
+    # torch.load defaults to weights_only=True, which rejects these non-tensor objects.
+    # Resume uses locally produced checkpoints and must restore the full training state.
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict) or "model" not in ckpt:
+        raise ValueError(f"Invalid training checkpoint: {checkpoint_path}")
+
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=bool(strict_model))
+    if missing:
+        rank0_info(f"[resume] missing model keys: {len(missing)}")
+    if unexpected:
+        rank0_info(f"[resume] unexpected model keys: {len(unexpected)}")
+
+    if bool(resume_optimizer) and ckpt.get("optimizer") is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if bool(resume_scaler) and scaler is not None and ckpt.get("scaler") is not None:
+        scaler.load_state_dict(ckpt["scaler"])
+    rng_restored = False
+    if bool(resume_rng_state) and ckpt.get("rng_state") is not None and get_world_size() <= 1:
+        _restore_rng_state(ckpt["rng_state"])
+        rng_restored = True
+
+    return {
+        "epoch": int(ckpt.get("epoch", 0)),
+        "step": int(ckpt.get("step", 0)),
+        "has_rng_state": ckpt.get("rng_state") is not None,
+        "rng_restored": rng_restored,
+    }
 
 
 def _build_model(cfg) -> PixelDiTT2IPMF:
@@ -352,6 +442,7 @@ def _maybe_run_epoch_eval(
         max_samples=epoch_max_samples,
         global_step=int(step),
         device=f"cuda:{device.index}" if device.type == "cuda" and device.index is not None else device.type,
+        num_workers_override=int(getattr(eval_cfg, "epoch_end_num_workers", 0)),
     )
     rank0_info(
         f"[eval] epoch-end evaluation starts: epoch={int(epoch)+1}, step={int(step)}, checkpoint={checkpoint_path}"
@@ -522,6 +613,14 @@ def train(cfg, workdir: str):
     else:
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    resume_cfg = getattr(cfg, "resume", None)
+    resume_enabled = bool(getattr(resume_cfg, "enabled", False)) if resume_cfg is not None else False
+    resume_path = str(getattr(resume_cfg, "checkpoint", "")).strip() if resume_cfg is not None else ""
+    resume_strict_model = bool(getattr(resume_cfg, "strict_model", True)) if resume_cfg is not None else True
+    resume_optimizer = bool(getattr(resume_cfg, "optimizer", True)) if resume_cfg is not None else True
+    resume_scaler = bool(getattr(resume_cfg, "scaler", True)) if resume_cfg is not None else True
+    resume_rng_state = bool(getattr(resume_cfg, "rng_state", True)) if resume_cfg is not None else True
+
     loss_cfg = LossConfig(
         norm_p=float(cfg.loss.norm_p),
         norm_eps=float(cfg.loss.norm_eps),
@@ -570,14 +669,52 @@ def train(cfg, workdir: str):
     t_eps = float(cfg.training.t_eps)
     start_time = time.time()
     jvp_fallback_emitted = False
+    start_epoch = 0
+    resume_skip_batches = 0
     # torch.func.jvp can fail on some operator stacks (e.g., captured in-place copy_)
     # and may leave the current step graph in a bad state. Keep it opt-in.
     use_func_jvp = bool(getattr(cfg.training, "use_func_jvp", False))
     if is_main_process() and (not use_func_jvp):
         rank0_info("JVP backend: finite-difference (torch.func.jvp disabled; set training.use_func_jvp=true to opt in).")
 
+    if resume_enabled:
+        if resume_path == "":
+            raise ValueError("resume.enabled=true requires resume.checkpoint")
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        resume_info = _load_training_checkpoint(
+            checkpoint_path=resume_path,
+            model=model_core,
+            optimizer=optimizer,
+            scaler=scaler,
+            strict_model=resume_strict_model,
+            resume_optimizer=resume_optimizer,
+            resume_scaler=resume_scaler,
+            resume_rng_state=resume_rng_state,
+        )
+        state.epoch = int(resume_info["epoch"])
+        state.step = int(resume_info["step"])
+        steps_per_epoch = max(1, len(train_loader))
+        resume_skip_batches = int(state.step % steps_per_epoch)
+        start_epoch = int(state.epoch) + (1 if resume_skip_batches == 0 else 0)
+        topk_entries = _load_topk_train_loss_entries(workdir=workdir, top_k=1)
+        rank0_info(
+            f"[resume] loaded checkpoint={resume_path}, epoch={state.epoch}, step={state.step}, "
+            f"start_epoch={start_epoch}, skip_batches={resume_skip_batches}"
+        )
+        if bool(resume_info.get("has_rng_state", False)) and not bool(resume_info.get("rng_restored", False)):
+            rank0_info(
+                "[resume] RNG state is not restored under multi-rank training because the checkpoint stores only "
+                "rank0 RNG. Model/optimizer/scaler resume is exact; randomness resume is approximate."
+            )
+        elif not bool(resume_info.get("has_rng_state", False)):
+            rank0_info(
+                "[resume] checkpoint has no RNG state; exact randomness cannot be restored. "
+                "This epoch-end checkpoint can still resume effectively seamlessly."
+            )
+
     model.train()
-    for epoch in range(int(cfg.training.num_epochs)):
+    for epoch in range(int(start_epoch), int(cfg.training.num_epochs)):
         state.epoch = epoch
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -586,6 +723,8 @@ def train(cfg, workdir: str):
         epoch_meter = AverageMeter()
 
         for batch_idx, batch in enumerate(train_loader):
+            if epoch == int(start_epoch) and resume_skip_batches > 0 and batch_idx < resume_skip_batches:
+                continue
             indices, images, _labels = batch
             images = images.to(device=device, non_blocking=True)
             bsz = images.shape[0]
