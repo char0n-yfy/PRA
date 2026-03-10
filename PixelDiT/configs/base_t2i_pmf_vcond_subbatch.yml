@@ -78,8 +78,9 @@ training:
   class_dropout_prob: 0.1
   noise_scale: 2.0
   t_eps: 0.025
-  # Baseline JVP tangent: data-derived sample-conditional velocity v_t.
-  jvp_tangent_mode: vt
+  # Tangent experiment: use conditioned v_pred for JVP, recomputing only the
+  # dropped subset (drop_mask=True) with a cond-only forward.
+  jvp_tangent_mode: vcond_subbatch
 
 time_sampling:
   data_proportion: 0.5
@@ -103,7 +104,7 @@ loss:
   convnext_model_name: /root/autodl-tmp/hf_models/convnextv2-base-22k-224
 
 evaluation:
-  enabled: true
+  enabled: false
   run_every_n_epochs: 1
   fail_on_error: false
   # Force single-process dataloader inside in-training epoch-end eval to avoid
@@ -167,9 +168,9 @@ ddp:
   find_unused_parameters: false
 
 resume:
-  enabled: true
-  checkpoint: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf/20260306-111136/checkpoints/checkpoint_step_00106761.pt
-  workdir: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf/20260306-111136
+  enabled: false
+  checkpoint: ""
+  workdir: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf_vcond_subbatch
   strict_model: true
   optimizer: true
   scaler: true

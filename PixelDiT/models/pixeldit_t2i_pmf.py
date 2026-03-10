@@ -70,6 +70,57 @@ class SpatialNet(nn.Module):
         return self.net(edge_map)
 
 
+class _ConvResidualBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        c = int(channels)
+        self.block = nn.Sequential(
+            nn.Conv2d(c, c, kernel_size=3, stride=1, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(c, c, kernel_size=3, stride=1, padding=1),
+        )
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x + self.block(x))
+
+
+class TextureNet(nn.Module):
+    """Independent texture encoder that maps a multi-channel texture tensor to patch-grid features."""
+
+    def __init__(self, patch_size: int, in_channels: int = 12, out_channels: int = 64, res_blocks: int = 2):
+        super().__init__()
+        p = int(patch_size)
+        if not _is_power_of_two(p):
+            raise ValueError(f"TextureNet requires power-of-2 patch_size, got {patch_size}")
+        steps = int(round(math.log2(p)))
+        if steps <= 0:
+            raise ValueError(f"TextureNet expects patch_size>=2, got {patch_size}")
+
+        out_c = int(out_channels)
+        if steps == 1:
+            ch_list = [out_c]
+        elif steps == 2:
+            ch_list = [32, out_c]
+        else:
+            ch_list = [32, 64] + [64] * (steps - 3) + [out_c]
+
+        layers = []
+        in_c = int(in_channels)
+        for c in ch_list:
+            layers.append(nn.Conv2d(in_c, int(c), kernel_size=3, stride=2, padding=1))
+            layers.append(nn.SiLU())
+            in_c = int(c)
+        self.down = nn.Sequential(*layers)
+        self.res = nn.Sequential(*[_ConvResidualBlock(out_c) for _ in range(max(0, int(res_blocks)))])
+
+    def forward(self, tex_map: torch.Tensor) -> torch.Tensor:
+        if tex_map.ndim != 4:
+            raise ValueError(f"tex_map must be NCHW, got {tuple(tex_map.shape)}")
+        feat = self.down(tex_map)
+        return self.res(feat)
+
+
 class PixelDiTT2IPMF(nn.Module):
     """PixelDiT-T2I backbone adapted for pMF strategy-CFG training.
 
@@ -97,6 +148,11 @@ class PixelDiTT2IPMF(nn.Module):
         sem_pool_num_heads: int = 12,
         enable_edge_cond: bool = False,
         edge_channels: int = 64,
+        enable_tex_cond: bool = False,
+        tex_in_channels: int = 12,
+        tex_channels: int = 64,
+        tex_res_blocks: int = 2,
+        tex_inject_u_head: bool = True,
         use_qknorm: bool = True,
         use_swiglu: bool = True,
         use_rope: bool = True,
@@ -115,6 +171,10 @@ class PixelDiTT2IPMF(nn.Module):
         self.sem_in_dim = int(sem_in_dim)
         self.sem_num_tokens = int(sem_num_tokens)
         self.enable_edge_cond = bool(enable_edge_cond)
+        self.enable_tex_cond = bool(enable_tex_cond)
+        self.tex_in_channels = int(tex_in_channels)
+        self.tex_channels = int(tex_channels)
+        self.tex_inject_u_head = bool(tex_inject_u_head)
 
         self.num_patches = (self.input_size // self.patch_size) ** 2
 
@@ -155,6 +215,29 @@ class PixelDiTT2IPMF(nn.Module):
             self.spatial_net = None
             self.edge_proj = None
             self.edge_gate = None
+
+        if self.enable_tex_cond:
+            if not self.tex_inject_u_head:
+                raise ValueError("Texture conditioning currently supports u_head injection only.")
+            self.tex_net = TextureNet(
+                patch_size=self.patch_size,
+                in_channels=self.tex_in_channels,
+                out_channels=self.tex_channels,
+                res_blocks=int(tex_res_blocks),
+            )
+            self.u_tex_delta_heads = nn.ModuleList(
+                [
+                    nn.Linear(
+                        self.tex_channels,
+                        (self.patch_size * self.patch_size) * 6 * self.pixel_dim,
+                        bias=True,
+                    )
+                    for _ in range(int(pixel_head_depth))
+                ]
+            )
+        else:
+            self.tex_net = None
+            self.u_tex_delta_heads = None
 
         self.t_embedder = TimestepEmbedder(self.hidden_size)
         self.h_embedder = TimestepEmbedder(self.hidden_size)
@@ -275,6 +358,18 @@ class PixelDiTT2IPMF(nn.Module):
         res = self.edge_proj(tok)
         return res.to(dtype=dtype)
 
+    def _encode_tex(self, tex_map: torch.Tensor, expected_seq_len: int, dtype: torch.dtype) -> torch.Tensor:
+        if not self.enable_tex_cond:
+            raise RuntimeError("_encode_tex called while enable_tex_cond=False")
+        assert self.tex_net is not None
+        feat = self.tex_net(tex_map)
+        tok = feat.flatten(2).transpose(1, 2)
+        if tok.shape[1] != int(expected_seq_len):
+            raise ValueError(
+                f"texture tokens seq_len mismatch: got {tok.shape[1]}, expected {int(expected_seq_len)}"
+            )
+        return tok.to(dtype=dtype)
+
     def _encode_semantic(
         self,
         sem_tokens: torch.Tensor,
@@ -352,6 +447,10 @@ class PixelDiTT2IPMF(nn.Module):
         for block in list(self.shared_pixel_blocks) + list(self.u_head_blocks) + list(self.v_head_blocks):
             nn.init.constant_(block.pixelwise_adaln.mlp[-1].weight, 0)
             nn.init.constant_(block.pixelwise_adaln.mlp[-1].bias, 0)
+        if self.u_tex_delta_heads is not None:
+            for head in self.u_tex_delta_heads:
+                nn.init.constant_(head.weight, 0)
+                nn.init.constant_(head.bias, 0)
 
         for final in [self.u_final_layer, self.v_final_layer]:
             nn.init.constant_(final.adaLN_modulation[-1].weight, 0)
@@ -392,6 +491,7 @@ class PixelDiTT2IPMF(nn.Module):
         sem_mask: Optional[torch.Tensor] = None,
         sem_drop_mask: Optional[torch.Tensor] = None,
         edge_map: Optional[torch.Tensor] = None,
+        tex_map: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         b, c, height, width = x.shape
         if c != self.in_channels:
@@ -419,6 +519,20 @@ class PixelDiTT2IPMF(nn.Module):
                     f"edge_map shape must be (B,1,H,W)=({b},1,{height},{width}), got {tuple(edge_map.shape)}"
                 )
             edge_res = self._encode_edge(edge_map.to(device=x.device), expected_seq_len=l, dtype=s.dtype)
+
+        tex_feat = None
+        if self.enable_tex_cond:
+            if tex_map is None:
+                raise ValueError("tex_map must be provided when texture.enable=true")
+            if tex_map.shape[0] != b or tex_map.shape[2] != height or tex_map.shape[3] != width:
+                raise ValueError(
+                    f"tex_map shape must be (B,C,H,W)=({b},{self.tex_in_channels},{height},{width}), got {tuple(tex_map.shape)}"
+                )
+            if tex_map.shape[1] != self.tex_in_channels:
+                raise ValueError(
+                    f"tex_map channel count must be {self.tex_in_channels}, got {tex_map.shape[1]}"
+                )
+            tex_feat = self._encode_tex(tex_map.to(device=x.device), expected_seq_len=l, dtype=s.dtype)
 
         for i, block in enumerate(self.patch_blocks):
             if edge_res is not None:
@@ -455,12 +569,28 @@ class PixelDiTT2IPMF(nn.Module):
         u_tokens = p_tokens
         v_tokens = p_tokens
 
-        for block in self.u_head_blocks:
-            u_tokens = self._maybe_checkpoint(
-                lambda p_in, s_in: block(p_in, s_in, rope=self.patch_rope),
-                u_tokens,
-                s_cond,
-            )
+        for i, block in enumerate(self.u_head_blocks):
+            tex_delta = None
+            if tex_feat is not None and self.u_tex_delta_heads is not None:
+                tex_delta = self.u_tex_delta_heads[i](tex_feat).view(
+                    b,
+                    l,
+                    p * p,
+                    6 * self.pixel_dim,
+                ).to(dtype=u_tokens.dtype)
+            if tex_delta is None:
+                u_tokens = self._maybe_checkpoint(
+                    lambda p_in, s_in: block(p_in, s_in, rope=self.patch_rope),
+                    u_tokens,
+                    s_cond,
+                )
+            else:
+                u_tokens = self._maybe_checkpoint(
+                    lambda p_in, s_in, d_in: block(p_in, s_in, rope=self.patch_rope, tex_delta=d_in),
+                    u_tokens,
+                    s_cond,
+                    tex_delta,
+                )
         for block in self.v_head_blocks:
             v_tokens = self._maybe_checkpoint(
                 lambda p_in, s_in: block(p_in, s_in, rope=self.patch_rope),

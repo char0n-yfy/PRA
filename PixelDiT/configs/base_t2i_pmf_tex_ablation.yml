@@ -30,14 +30,26 @@ spatial:
   # Optional spatial (edge) condition injection into the patch-level image stream.
   enable_edge: true
   # Edge preprocessing (computed from clean x during training).
-  edge_blur_sigma: 1.0
+  edge_blur_sigma: 0.0
   edge_threshold: 0.0
   # SpatialNet output channels (C_e). Typical: 64 or 128.
   edge_channels: 64
 
 texture:
-  # Keep the base configuration on the original no-texture path.
-  enable: false
+  # Independent texture branch for dense modulation of u_head pixel refiners.
+  enable: true
+  in_channels: 12
+  channels: 64
+  res_blocks: 2
+  inject_u_head: true
+  # 3-level stationary Haar high bands (9) + 2 DoG bands + edge magnitude = 12 channels.
+  wavelet_levels: 3
+  dog_sigmas:
+    - [0.8, 1.6]
+    - [1.6, 3.2]
+  norm_quantile: 0.95
+  norm_clip: 3.0
+  norm_stats_stride: 4
 
 model:
   input_size: 512
@@ -70,16 +82,14 @@ training:
   gradient_accumulation_steps: 1
   # Match outer pMF naming (steps between scalar logs).
   log_per_step: 100
-  learning_rate: 1e-4
+  learning_rate: 3.0e-4
   weight_decay: 0.0
-  grad_clip: 0.5
+  grad_clip: 1.0
   use_amp: true
   amp_dtype: bf16
   class_dropout_prob: 0.1
   noise_scale: 2.0
   t_eps: 0.025
-  # Baseline JVP tangent: data-derived sample-conditional velocity v_t.
-  jvp_tangent_mode: vt
 
 time_sampling:
   data_proportion: 0.5
@@ -167,13 +177,12 @@ ddp:
   find_unused_parameters: false
 
 resume:
-  enabled: true
+  # This ablation adds new texture parameters, so strict stateful resume from the
+  # base run is intentionally disabled. Start a fresh run for this config.
+  enabled: false
   checkpoint: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf/20260306-111136/checkpoints/checkpoint_step_00106761.pt
   workdir: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf/20260306-111136
   strict_model: true
   optimizer: true
   scaler: true
   rng_state: true
-  # Keep optimizer/scaler state, but force lr/wd to follow the current config.
-  override_lr_from_config: true
-  override_weight_decay_from_config: false

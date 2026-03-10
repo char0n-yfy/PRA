@@ -38,6 +38,7 @@ from PixelDiT.utils.semantic_cache import DinoSemanticCache, IndexedDatasetWrapp
 from PixelDiT.utils.time_sampling import sample_tr
 from PixelDiT.utils.dino_encoder import DinoEncoder, DinoEncoderConfig
 from PixelDiT.utils.edge import sobel_edge_map
+from PixelDiT.utils.texture import build_texture_map
 
 try:
     from torch.func import jvp as func_jvp
@@ -340,6 +341,8 @@ def _load_training_checkpoint(
     resume_optimizer: bool = True,
     resume_scaler: bool = True,
     resume_rng_state: bool = True,
+    override_lr: float | None = None,
+    override_weight_decay: float | None = None,
 ) -> dict:
     # Full training checkpoints include optimizer/scaler/RNG states. Under PyTorch 2.6,
     # torch.load defaults to weights_only=True, which rejects these non-tensor objects.
@@ -356,6 +359,12 @@ def _load_training_checkpoint(
 
     if bool(resume_optimizer) and ckpt.get("optimizer") is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
+        if override_lr is not None:
+            for group in optimizer.param_groups:
+                group["lr"] = float(override_lr)
+        if override_weight_decay is not None:
+            for group in optimizer.param_groups:
+                group["weight_decay"] = float(override_weight_decay)
     if bool(resume_scaler) and scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
     rng_restored = False
@@ -376,6 +385,8 @@ def _build_model(cfg) -> PixelDiTT2IPMF:
     spatial = getattr(cfg, "spatial", None)
     enable_edge = bool(getattr(spatial, "enable_edge", False)) if spatial is not None else False
     edge_channels = int(getattr(spatial, "edge_channels", 64)) if spatial is not None else 64
+    texture = getattr(cfg, "texture", None)
+    enable_tex = bool(getattr(texture, "enable", False)) if texture is not None else False
     return PixelDiTT2IPMF(
         input_size=int(m.input_size),
         patch_size=int(m.patch_size),
@@ -393,6 +404,11 @@ def _build_model(cfg) -> PixelDiTT2IPMF:
         sem_pool_num_heads=int(getattr(m, "sem_pool_num_heads", 12)),
         enable_edge_cond=enable_edge,
         edge_channels=edge_channels,
+        enable_tex_cond=enable_tex,
+        tex_in_channels=int(getattr(texture, "in_channels", 12)) if texture is not None else 12,
+        tex_channels=int(getattr(texture, "channels", 64)) if texture is not None else 64,
+        tex_res_blocks=int(getattr(texture, "res_blocks", 2)) if texture is not None else 2,
+        tex_inject_u_head=bool(getattr(texture, "inject_u_head", True)) if texture is not None else True,
         use_qknorm=bool(m.use_qknorm),
         use_swiglu=bool(m.use_swiglu),
         use_rope=bool(m.use_rope),
@@ -509,6 +525,13 @@ def train(cfg, workdir: str):
     use_edge_cond = bool(getattr(spatial_cfg, "enable_edge", False)) if spatial_cfg is not None else False
     edge_blur_sigma = float(getattr(spatial_cfg, "edge_blur_sigma", 1.0)) if spatial_cfg is not None else 1.0
     edge_threshold = float(getattr(spatial_cfg, "edge_threshold", 0.0)) if spatial_cfg is not None else 0.0
+    texture_cfg = getattr(cfg, "texture", None)
+    use_tex_cond = bool(getattr(texture_cfg, "enable", False)) if texture_cfg is not None else False
+    tex_wavelet_levels = int(getattr(texture_cfg, "wavelet_levels", 3)) if texture_cfg is not None else 3
+    tex_dog_sigmas = tuple(tuple(map(float, pair)) for pair in getattr(texture_cfg, "dog_sigmas", ((0.8, 1.6), (1.6, 3.2))))
+    tex_norm_quantile = float(getattr(texture_cfg, "norm_quantile", 0.95)) if texture_cfg is not None else 0.95
+    tex_norm_clip = float(getattr(texture_cfg, "norm_clip", 3.0)) if texture_cfg is not None else 3.0
+    tex_norm_stats_stride = int(getattr(texture_cfg, "norm_stats_stride", 4)) if texture_cfg is not None else 4
 
     semantic_cache = None
     dino_encoder = None
@@ -620,6 +643,8 @@ def train(cfg, workdir: str):
     resume_optimizer = bool(getattr(resume_cfg, "optimizer", True)) if resume_cfg is not None else True
     resume_scaler = bool(getattr(resume_cfg, "scaler", True)) if resume_cfg is not None else True
     resume_rng_state = bool(getattr(resume_cfg, "rng_state", True)) if resume_cfg is not None else True
+    resume_override_lr = bool(getattr(resume_cfg, "override_lr_from_config", False)) if resume_cfg is not None else False
+    resume_override_wd = bool(getattr(resume_cfg, "override_weight_decay_from_config", False)) if resume_cfg is not None else False
 
     loss_cfg = LossConfig(
         norm_p=float(cfg.loss.norm_p),
@@ -674,8 +699,26 @@ def train(cfg, workdir: str):
     # torch.func.jvp can fail on some operator stacks (e.g., captured in-place copy_)
     # and may leave the current step graph in a bad state. Keep it opt-in.
     use_func_jvp = bool(getattr(cfg.training, "use_func_jvp", False))
+    jvp_tangent_mode = str(getattr(cfg.training, "jvp_tangent_mode", "vt")).strip().lower()
+    if jvp_tangent_mode not in {"vt", "vcond_subbatch", "mix_vcond_subbatch"}:
+        raise ValueError(
+            "training.jvp_tangent_mode must be one of {'vt','vcond_subbatch','mix_vcond_subbatch'}"
+        )
+    jvp_tangent_lambda = float(getattr(cfg.training, "jvp_tangent_lambda", 0.25))
+    if not (0.0 <= jvp_tangent_lambda <= 1.0):
+        raise ValueError("training.jvp_tangent_lambda must be in [0,1].")
     if is_main_process() and (not use_func_jvp):
         rank0_info("JVP backend: finite-difference (torch.func.jvp disabled; set training.use_func_jvp=true to opt in).")
+    if is_main_process():
+        if jvp_tangent_mode == "vt":
+            rank0_info("JVP tangent: data velocity v_t.")
+        elif jvp_tangent_mode == "vcond_subbatch":
+            rank0_info("JVP tangent: conditioned v_pred with drop-only cond recompute.")
+        else:
+            rank0_info(
+                f"JVP tangent: mix((1-lambda)*v_t + lambda*v_cond_pred), lambda={jvp_tangent_lambda:.3f}, "
+                "where v_cond_pred uses drop-only cond recompute."
+            )
 
     if resume_enabled:
         if resume_path == "":
@@ -691,6 +734,8 @@ def train(cfg, workdir: str):
             resume_optimizer=resume_optimizer,
             resume_scaler=resume_scaler,
             resume_rng_state=resume_rng_state,
+            override_lr=float(cfg.training.learning_rate) if resume_override_lr else None,
+            override_weight_decay=float(cfg.training.weight_decay) if resume_override_wd else None,
         )
         state.epoch = int(resume_info["epoch"])
         state.step = int(resume_info["step"])
@@ -730,6 +775,7 @@ def train(cfg, workdir: str):
             bsz = images.shape[0]
 
             edge_map = None
+            tex_map = None
             if use_edge_cond:
                 with torch.no_grad():
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
@@ -738,6 +784,16 @@ def train(cfg, workdir: str):
                             blur_sigma=edge_blur_sigma,
                             threshold=edge_threshold,
                         )
+            if use_tex_cond:
+                with torch.no_grad():
+                    tex_map = build_texture_map(
+                        images,
+                        wavelet_levels=tex_wavelet_levels,
+                        dog_sigmas=tex_dog_sigmas,
+                        norm_quantile=tex_norm_quantile,
+                        norm_clip=tex_norm_clip,
+                        norm_stats_stride=tex_norm_stats_stride,
+                    )
 
             if semantic_cache is not None:
                 sem_tokens = semantic_cache.get_batch(
@@ -779,12 +835,40 @@ def train(cfg, workdir: str):
                     sem_mask=None,
                     sem_drop_mask=drop_mask,
                     edge_map=edge_map,
+                    tex_map=tex_map,
                 )
                 x_hat_u = out["x_hat_u"]
                 x_hat_v = out["x_hat_v"]
 
                 u_pred = (z_t - x_hat_u) / t_clamp
                 v_pred = (z_t - x_hat_v) / t_clamp
+
+                v_tangent = v_t.detach()
+                if jvp_tangent_mode != "vt":
+                    v_cond_pred = v_pred.detach()
+                    if bool(drop_mask.any().item()):
+                        idx = torch.nonzero(drop_mask, as_tuple=False).reshape(-1)
+                        cond_mask_sub = torch.zeros((idx.numel(),), device=device, dtype=torch.bool)
+                        edge_sub = edge_map[idx] if edge_map is not None else None
+                        tex_sub = tex_map[idx] if tex_map is not None else None
+                        with torch.no_grad():
+                            out_cond_sub = model(
+                                x=z_t[idx],
+                                t=t[idx].reshape(-1),
+                                h=h[idx].reshape(-1),
+                                sem_tokens=sem_tokens[idx],
+                                sem_mask=None,
+                                sem_drop_mask=cond_mask_sub,
+                                edge_map=edge_sub,
+                                tex_map=tex_sub,
+                            )
+                            x_hat_v_cond_sub = out_cond_sub["x_hat_v"]
+                            v_cond_pred = v_cond_pred.clone()
+                            v_cond_pred[idx] = (z_t[idx] - x_hat_v_cond_sub) / t_clamp[idx]
+                    if jvp_tangent_mode == "vcond_subbatch":
+                        v_tangent = v_cond_pred.detach()
+                    else:
+                        v_tangent = ((1.0 - jvp_tangent_lambda) * v_t + jvp_tangent_lambda * v_cond_pred).detach()
 
                 def u_only(z_in, t_in, r_in):
                     out_u = model(
@@ -795,6 +879,7 @@ def train(cfg, workdir: str):
                         sem_mask=None,
                         sem_drop_mask=drop_mask,
                         edge_map=edge_map,
+                        tex_map=tex_map,
                     )["x_hat_u"]
                     return (z_in - out_u) / torch.clamp(t_in, min=t_eps)
 
@@ -808,7 +893,7 @@ def train(cfg, workdir: str):
                             _, du_dt = func_jvp(
                                 u_only,
                                 (z_t, t, r),
-                                (v_t.detach(), dtdt, dtdr),
+                                (v_tangent, dtdt, dtdr),
                             )
                     except Exception as exc:
                         jvp_exc = exc
@@ -821,7 +906,7 @@ def train(cfg, workdir: str):
                     # the V = u + (t-r) * du_dt structure.
                     fd_eps = float(getattr(cfg.training, "jvp_fd_eps", 1.0e-3))
                     with torch.no_grad():
-                        z_eps = z_t + fd_eps * v_t.detach()
+                        z_eps = z_t + fd_eps * v_tangent
                         t_eps_fd = torch.clamp(t + fd_eps * dtdt, min=t_eps)
                         r_eps = r + fd_eps * dtdr
                         u_eps = u_only(z_eps, t_eps_fd, r_eps)
@@ -904,6 +989,7 @@ def train(cfg, workdir: str):
                     h_probe = h[:probe_n].detach().reshape(-1)
                     sem_probe = sem_tokens[:probe_n].detach()
                     edge_probe = edge_map[:probe_n].detach() if edge_map is not None else None
+                    tex_probe = tex_map[:probe_n].detach() if tex_map is not None else None
                     t_probe_clamp = torch.clamp(t_probe.view(-1, 1, 1, 1), min=t_eps)
                     cond_mask = torch.zeros((probe_n,), device=device, dtype=torch.bool)
                     uncond_mask = torch.ones((probe_n,), device=device, dtype=torch.bool)
@@ -918,6 +1004,7 @@ def train(cfg, workdir: str):
                                 sem_mask=None,
                                 sem_drop_mask=cond_mask,
                                 edge_map=edge_probe,
+                                tex_map=tex_probe,
                             )
                             out_uncond = model(
                                 x=z_probe,
@@ -927,6 +1014,7 @@ def train(cfg, workdir: str):
                                 sem_mask=None,
                                 sem_drop_mask=uncond_mask,
                                 edge_map=edge_probe,
+                                tex_map=tex_probe,
                             )
 
                             u_cond = (z_probe - out_cond["x_hat_u"]) / t_probe_clamp
@@ -1070,11 +1158,14 @@ def smoke_test_forward(config_dict: dict):
     h_span = torch.rand(b)
     sem = torch.randn(b, sem_toks, sem_dim)
     edge_map = None
+    tex_map = None
     if bool(getattr(getattr(cfg, "spatial", None), "enable_edge", False)):
         edge_map = torch.rand(b, 1, h, w)
+    if bool(getattr(getattr(cfg, "texture", None), "enable", False)):
+        tex_map = build_texture_map(x)
 
     with torch.no_grad():
-        out = model(x=x, t=t, h=h_span, sem_tokens=sem, edge_map=edge_map)
+        out = model(x=x, t=t, h=h_span, sem_tokens=sem, edge_map=edge_map, tex_map=tex_map)
     assert out["x_hat_u"].shape == x.shape
     assert out["x_hat_v"].shape == x.shape
     return {"ok": True, "shape": tuple(out["x_hat_u"].shape)}

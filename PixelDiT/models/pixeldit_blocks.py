@@ -474,7 +474,13 @@ class PixelTransformerBlock(nn.Module):
             drop=0,
         )
 
-    def forward(self, x: torch.Tensor, s_cond: torch.Tensor, rope=None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        s_cond: torch.Tensor,
+        rope=None,
+        tex_delta: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         b, l, p2, d_pix = x.shape
         d_sem = self.semantic_dim
 
@@ -482,6 +488,18 @@ class PixelTransformerBlock(nn.Module):
         s_cond_flat = s_cond.reshape(b * l, -1)
 
         shift1, scale1, gate1, shift2, scale2, gate2 = self.pixelwise_adaln(s_cond_flat)
+        if tex_delta is not None:
+            if tex_delta.shape != (b, l, p2, 6 * d_pix):
+                raise ValueError(
+                    f"tex_delta must be {(b, l, p2, 6 * d_pix)}, got {tuple(tex_delta.shape)}"
+                )
+            dshift1, dscale1, dgate1, dshift2, dscale2, dgate2 = tex_delta.reshape(b * l, p2, 6 * d_pix).chunk(6, dim=-1)
+            shift1 = shift1 + dshift1
+            scale1 = scale1 + dscale1
+            gate1 = gate1 + dgate1
+            shift2 = shift2 + dshift2
+            scale2 = scale2 + dscale2
+            gate2 = gate2 + dgate2
 
         x_mod = pixel_modulate(self.norm1(x), shift1, scale1)
         x_compact = self.compaction.compact(x_mod).reshape(b, l, d_sem)

@@ -9,6 +9,13 @@
           </advancedOptions>
         </fileTransfer>
       </webServer>
+      <webServer id="3a7b2482-934b-41ed-97cf-06e35187508e" name="pmf_pro6000">
+        <fileTransfer rootFolder="/root" accessType="SFTP" host="connect.westd.seetacloud.com" port="45201" sshConfigId="e9acc5cc-6694-4255-801a-b30643f748a6" sshConfig="root@connect.westd.seetacloud.com:45201 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
     </option>
   </component>
 </project>

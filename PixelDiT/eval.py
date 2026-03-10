@@ -32,6 +32,7 @@ from PixelDiT.train import build_imagefolder_dataset
 from PixelDiT.utils.dino_encoder import DinoEncoder, DinoEncoderConfig, preprocess_for_hf_vision_encoder
 from PixelDiT.utils.edge import sobel_edge_map
 from PixelDiT.utils.semantic_cache import DinoSemanticCache, IndexedDatasetWrapper
+from PixelDiT.utils.texture import build_texture_map
 
 
 def _as_namespace(obj):
@@ -84,6 +85,8 @@ def _build_model(cfg, device: torch.device) -> PixelDiTT2IPMF:
     spatial = getattr(cfg, "spatial", None)
     enable_edge = bool(getattr(spatial, "enable_edge", False)) if spatial is not None else False
     edge_channels = int(getattr(spatial, "edge_channels", 64)) if spatial is not None else 64
+    texture = getattr(cfg, "texture", None)
+    enable_tex = bool(getattr(texture, "enable", False)) if texture is not None else False
     model = PixelDiTT2IPMF(
         input_size=int(m.input_size),
         patch_size=int(m.patch_size),
@@ -101,6 +104,11 @@ def _build_model(cfg, device: torch.device) -> PixelDiTT2IPMF:
         sem_pool_num_heads=int(getattr(m, "sem_pool_num_heads", 12)),
         enable_edge_cond=enable_edge,
         edge_channels=edge_channels,
+        enable_tex_cond=enable_tex,
+        tex_in_channels=int(getattr(texture, "in_channels", 12)) if texture is not None else 12,
+        tex_channels=int(getattr(texture, "channels", 64)) if texture is not None else 64,
+        tex_res_blocks=int(getattr(texture, "res_blocks", 2)) if texture is not None else 2,
+        tex_inject_u_head=bool(getattr(texture, "inject_u_head", True)) if texture is not None else True,
         use_qknorm=bool(m.use_qknorm),
         use_swiglu=bool(m.use_swiglu),
         use_rope=bool(m.use_rope),
@@ -290,6 +298,7 @@ def _run_guided(
     num_steps: int,
     sem_cond: torch.Tensor,
     edge_map: Optional[torch.Tensor],
+    tex_map: Optional[torch.Tensor],
     omega: float,
     t_min: float,
     t_max: float,
@@ -306,7 +315,16 @@ def _run_guided(
         t = torch.full((b,), t_val, device=device, dtype=dtype)
         h = torch.full((b,), t_val - r_val, device=device, dtype=dtype)
 
-        out_c = model(x=z, t=t, h=h, sem_tokens=sem_cond, sem_mask=None, sem_drop_mask=None, edge_map=edge_map)
+        out_c = model(
+            x=z,
+            t=t,
+            h=h,
+            sem_tokens=sem_cond,
+            sem_mask=None,
+            sem_drop_mask=None,
+            edge_map=edge_map,
+            tex_map=tex_map,
+        )
         x_hat_c = out_c["x_hat_u"]
         u_c = (z - x_hat_c) / torch.clamp(t.view(-1, 1, 1, 1), min=float(t_eps))
 
@@ -319,6 +337,7 @@ def _run_guided(
             sem_mask=None,
             sem_drop_mask=drop_mask,
             edge_map=edge_map,
+            tex_map=tex_map,
         )
         x_hat_u = out_u["x_hat_u"]
         u_u = (z - x_hat_u) / torch.clamp(t.view(-1, 1, 1, 1), min=float(t_eps))
@@ -520,6 +539,13 @@ def run_eval(args):
         enable_edge = bool(getattr(cfg.spatial, "enable_edge", False))
         edge_blur_sigma = float(getattr(cfg.spatial, "edge_blur_sigma", 1.0))
         edge_threshold = float(getattr(cfg.spatial, "edge_threshold", 0.0))
+        texture_cfg = getattr(cfg, "texture", None)
+        enable_tex = bool(getattr(texture_cfg, "enable", False)) if texture_cfg is not None else False
+        tex_wavelet_levels = int(getattr(texture_cfg, "wavelet_levels", 3)) if texture_cfg is not None else 3
+        tex_dog_sigmas = tuple(tuple(map(float, pair)) for pair in getattr(texture_cfg, "dog_sigmas", ((0.8, 1.6), (1.6, 3.2))))
+        tex_norm_quantile = float(getattr(texture_cfg, "norm_quantile", 0.95)) if texture_cfg is not None else 0.95
+        tex_norm_clip = float(getattr(texture_cfg, "norm_clip", 3.0)) if texture_cfg is not None else 3.0
+        tex_norm_stats_stride = int(getattr(texture_cfg, "norm_stats_stride", 4)) if texture_cfg is not None else 4
 
         save_vis = bool(getattr(cfg.evaluation.visualization, "save", True))
         vis_to_tb = bool(getattr(cfg.evaluation.visualization, "to_tensorboard", True))
@@ -571,12 +597,25 @@ def run_eval(args):
                 edge_map_batch = (
                     sobel_edge_map(x, blur_sigma=edge_blur_sigma, threshold=edge_threshold) if enable_edge else None
                 )
+                tex_map_batch = (
+                    build_texture_map(
+                        x,
+                        wavelet_levels=tex_wavelet_levels,
+                        dog_sigmas=tex_dog_sigmas,
+                        norm_quantile=tex_norm_quantile,
+                        norm_clip=tex_norm_clip,
+                        norm_stats_stride=tex_norm_stats_stride,
+                    )
+                    if enable_tex
+                    else None
+                )
 
                 for t_val in posthoc_t_values:
                     for bi in range(bsz):
                         x_b = x[bi : bi + 1]
                         sem_b = sem_cond_batch[bi : bi + 1]
                         edge_b = edge_map_batch[bi : bi + 1] if edge_map_batch is not None else None
+                        tex_b = tex_map_batch[bi : bi + 1] if tex_map_batch is not None else None
                         sample_key = int(global_idx[bi].item())
 
                         g = torch.Generator(device=device)
@@ -591,6 +630,7 @@ def run_eval(args):
                             num_steps=sweep.num_steps,
                             sem_cond=sem_b,
                             edge_map=edge_b,
+                            tex_map=tex_b,
                             omega=sweep.omega,
                             t_min=sweep.t_min,
                             t_max=sweep.t_max,
@@ -707,6 +747,18 @@ def run_eval(args):
                 edge_map_batch = (
                     sobel_edge_map(x, blur_sigma=edge_blur_sigma, threshold=edge_threshold) if enable_edge else None
                 )
+                tex_map_batch = (
+                    build_texture_map(
+                        x,
+                        wavelet_levels=tex_wavelet_levels,
+                        dog_sigmas=tex_dog_sigmas,
+                        norm_quantile=tex_norm_quantile,
+                        norm_clip=tex_norm_clip,
+                        norm_stats_stride=tex_norm_stats_stride,
+                    )
+                    if enable_tex
+                    else None
+                )
 
                 with torch.no_grad():
                     dino_x_batch = _mean_feature_from_tokens(dino_metric.encode(x, amp_dtype=torch.bfloat16))
@@ -717,6 +769,7 @@ def run_eval(args):
                         x_b = x[bi : bi + 1]
                         sem_b = sem_cond_batch[bi : bi + 1]
                         edge_b = edge_map_batch[bi : bi + 1] if edge_map_batch is not None else None
+                        tex_b = tex_map_batch[bi : bi + 1] if tex_map_batch is not None else None
                         dino_x = dino_x_batch[bi : bi + 1]
                         clip_x = clip_x_batch[bi : bi + 1] if clip_x_batch is not None else None
                         sample_key = int(global_idx[bi].item())
@@ -739,6 +792,7 @@ def run_eval(args):
                                 num_steps=sweep.num_steps,
                                 sem_cond=sem_b,
                                 edge_map=edge_b,
+                                tex_map=tex_b,
                                 omega=sweep.omega,
                                 t_min=sweep.t_min,
                                 t_max=sweep.t_max,
