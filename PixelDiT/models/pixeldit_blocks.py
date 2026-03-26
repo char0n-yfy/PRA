@@ -1,12 +1,166 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 import math
 from math import pi
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
+import torch.autograd.forward_ad as fwAD
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+
+try:
+    from jvp_flash_attention.jvp_attention import JVPAttn
+    _JVP_FLASH_ATTN_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover
+    JVPAttn = None
+    _JVP_FLASH_ATTN_IMPORT_ERROR = exc
+
+
+_JVP_ATTENTION_BACKEND: ContextVar[str] = ContextVar("pixeldit_jvp_attention_backend", default="native")
+
+
+def jvp_flash_attention_is_available() -> bool:
+    return JVPAttn is not None
+
+
+def jvp_flash_attention_import_error() -> Optional[str]:
+    if _JVP_FLASH_ATTN_IMPORT_ERROR is None:
+        return None
+    return repr(_JVP_FLASH_ATTN_IMPORT_ERROR)
+
+
+@contextmanager
+def use_jvp_attention_backend(backend: str):
+    token = _JVP_ATTENTION_BACKEND.set(str(backend).strip().lower())
+    try:
+        yield
+    finally:
+        _JVP_ATTENTION_BACKEND.reset(token)
+
+
+def _current_jvp_attention_backend() -> str:
+    return _JVP_ATTENTION_BACKEND.get()
+
+
+def _has_forward_ad_tangent(x: torch.Tensor) -> bool:
+    _, tangent = fwAD.unpack_dual(x)
+    return tangent is not None
+
+
+@contextmanager
+def _native_sdpa_math_context(force_math: bool):
+    if not force_math:
+        yield
+        return
+    if hasattr(torch, "nn") and hasattr(torch.nn, "attention") and hasattr(torch.nn.attention, "sdpa_kernel"):
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+
+        with sdpa_kernel([SDPBackend.MATH]):
+            yield
+        return
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False,
+            enable_math=True,
+            enable_mem_efficient=False,
+            enable_cudnn=False,
+        ):
+            yield
+        return
+    yield
+
+
+def _prepare_square_attn_mask(
+    attn_mask: Optional[torch.Tensor],
+    batch_size: int,
+    num_heads: int,
+    seq_len: int,
+) -> Optional[torch.Tensor]:
+    if attn_mask is None:
+        return None
+    if attn_mask.ndim != 4:
+        raise ValueError(f"attention mask must be 4D, got {tuple(attn_mask.shape)}")
+    if attn_mask.shape[0] != batch_size or attn_mask.shape[-2] != seq_len or attn_mask.shape[-1] != seq_len:
+        raise ValueError(
+            "attention mask must be (B,H|1,N,N), got "
+            f"{tuple(attn_mask.shape)} for expected B={batch_size}, N={seq_len}"
+        )
+    if attn_mask.shape[1] == 1:
+        attn_mask = attn_mask.expand(batch_size, num_heads, seq_len, seq_len)
+    elif attn_mask.shape[1] != num_heads:
+        raise ValueError(
+            "attention mask head dimension must be 1 or num_heads, got "
+            f"{attn_mask.shape[1]} for num_heads={num_heads}"
+        )
+    return attn_mask
+
+
+def _supports_jvp_flash_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    dropout_p: float,
+    is_causal: bool,
+) -> bool:
+    if JVPAttn is None:
+        return False
+    if dropout_p != 0.0:
+        return False
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        return False
+    if q.shape != k.shape or k.shape != v.shape:
+        return False
+    if q.shape[-2] < 32 or (q.shape[-2] % 2) != 0:
+        return False
+    if q.shape[-1] not in {16, 32, 64, 128, 256}:
+        return False
+    if is_causal and attn_mask is not None:
+        return False
+    if attn_mask is not None:
+        if attn_mask.ndim != 4 or attn_mask.shape[0] != q.shape[0] or attn_mask.shape[-2] != q.shape[-2] or attn_mask.shape[-1] != q.shape[-2]:
+            return False
+        if attn_mask.shape[1] not in {1, q.shape[1]}:
+            return False
+    return True
+
+
+def _scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    has_dual = _has_forward_ad_tangent(q) or _has_forward_ad_tangent(k) or _has_forward_ad_tangent(v)
+    backend = _current_jvp_attention_backend()
+
+    if has_dual and backend == "jvp_flash_attention":
+        if _supports_jvp_flash_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal):
+            attn_mask = _prepare_square_attn_mask(attn_mask, batch_size=q.shape[0], num_heads=q.shape[1], seq_len=q.shape[-2])
+            return JVPAttn.fwd_dual(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                causal=is_causal,
+                verify_attn_mask=False,
+            )
+
+    with _native_sdpa_math_context(force_math=has_dual):
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+        )
 
 
 class Mlp(nn.Module):
@@ -178,7 +332,7 @@ class Attention(nn.Module):
                 q = torch.cat(q_parts, dim=2)
                 k = torch.cat(k_parts, dim=2)
 
-        x = F.scaled_dot_product_attention(
+        x = _scaled_dot_product_attention(
             q,
             k,
             v,
@@ -238,7 +392,7 @@ class CrossAttention(nn.Module):
                 raise ValueError(f"kv_mask must be (B,N), got {tuple(kv_mask.shape)}")
             attn_mask = kv_mask[:, None, None, :].expand(b, self.num_heads, t, n)
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = _scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(b, t, d)
         return self.out_proj(out)
 
@@ -383,7 +537,7 @@ class MMDiTBlock(nn.Module):
             l_total = l_img + l_sem
             attn_mask = combined[:, None, None, :].expand(-1, -1, l_total, -1)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        attn_out = _scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         attn_out = attn_out.transpose(1, 2).reshape(b, l_img + l_sem, self.hidden_size)
         attn_img = attn_out[:, :l_img, :]
         attn_sem = attn_out[:, l_img:, :]

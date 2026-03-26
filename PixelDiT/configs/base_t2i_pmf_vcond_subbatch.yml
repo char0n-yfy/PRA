@@ -83,6 +83,10 @@ training:
   jvp_tangent_mode: vcond_subbatch
   # Prefer exact forward-mode JVP over finite-difference fallback.
   use_func_jvp: true
+  # Attention backend used only inside exact-JVP evaluation.
+  # Set to "native" to keep math-SDPA, or "jvp_flash_attention" to use Triton JVP FlashAttention
+  # for square self-attention while keeping native math fallback for non-square attention.
+  jvp_attention_backend: jvp_flash_attention
   # Split exact JVP into smaller per-rank chunks to reduce peak activation memory
   # without changing the underlying u/JVP objective.
   jvp_microbatch_size: 9

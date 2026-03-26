@@ -21,6 +21,11 @@ from torchvision import datasets, transforms
 from torchvision.datasets.folder import default_loader
 
 from PixelDiT.models import PixelDiTT2IPMF
+from PixelDiT.models.pixeldit_blocks import (
+    jvp_flash_attention_import_error,
+    jvp_flash_attention_is_available,
+    use_jvp_attention_backend,
+)
 from PixelDiT.utils.dist import (
     barrier,
     cleanup_distributed,
@@ -92,8 +97,10 @@ def _to_dict(ns):
     return ns
 
 
-def _jvp_sdpa_context():
-    """Use a conservative SDP backend for JVP to avoid unsupported flash-SDP derivatives."""
+def _jvp_sdpa_context(jvp_attention_backend: str):
+    """Use math SDPA only when exact JVP relies on native PyTorch attention kernels."""
+    if str(jvp_attention_backend).strip().lower() != "native":
+        return nullcontext()
     if not torch.cuda.is_available():
         return nullcontext()
     if hasattr(torch, "nn") and hasattr(torch.nn, "attention") and hasattr(torch.nn.attention, "sdpa_kernel"):
@@ -709,9 +716,17 @@ def train(cfg, workdir: str):
     jvp_tangent_lambda = float(getattr(cfg.training, "jvp_tangent_lambda", 0.25))
     if not (0.0 <= jvp_tangent_lambda <= 1.0):
         raise ValueError("training.jvp_tangent_lambda must be in [0,1].")
+    jvp_attention_backend = str(getattr(cfg.training, "jvp_attention_backend", "native")).strip().lower()
+    if jvp_attention_backend not in {"native", "jvp_flash_attention"}:
+        raise ValueError("training.jvp_attention_backend must be one of {'native','jvp_flash_attention'}.")
     jvp_microbatch_size = int(getattr(cfg.training, "jvp_microbatch_size", 0))
     if jvp_microbatch_size < 0:
         raise ValueError("training.jvp_microbatch_size must be >= 0.")
+    if use_func_jvp and jvp_attention_backend == "jvp_flash_attention" and not jvp_flash_attention_is_available():
+        raise RuntimeError(
+            "training.jvp_attention_backend='jvp_flash_attention' was requested, but the package is not importable. "
+            f"Import error: {jvp_flash_attention_import_error()}"
+        )
     if is_main_process():
         if use_func_jvp and (func_jvp is not None):
             if jvp_microbatch_size > 0:
@@ -722,6 +737,11 @@ def train(cfg, workdir: str):
             rank0_info("JVP backend: finite-difference (torch.func.jvp unavailable in this torch build).")
         else:
             rank0_info("JVP backend: finite-difference (torch.func.jvp disabled; set training.use_func_jvp=true to opt in).")
+    if is_main_process() and use_func_jvp:
+        if jvp_attention_backend == "jvp_flash_attention":
+            rank0_info("JVP attention backend: jvp_flash_attention for square self-attention; native math SDPA fallback for non-square attention.")
+        else:
+            rank0_info("JVP attention backend: native SDPA (math backend during exact JVP).")
     if is_main_process():
         if jvp_tangent_mode == "vt":
             rank0_info("JVP tangent: data velocity v_t.")
@@ -919,36 +939,37 @@ def train(cfg, workdir: str):
                 if use_func_jvp and (func_jvp is not None):
                     try:
                         with torch.no_grad():
-                            with _jvp_sdpa_context():
-                                if 0 < jvp_microbatch_size < bsz:
-                                    du_dt_chunks = []
-                                    # Split only the exact-JVP evaluation across samples.
-                                    # This preserves the objective because this path has no
-                                    # batch-dependent state such as BatchNorm.
-                                    for start in range(0, bsz, jvp_microbatch_size):
-                                        end = min(start + jvp_microbatch_size, bsz)
-                                        chunk = slice(start, end)
-                                        u_only_chunk = make_u_only(
-                                            sem_tokens_in=sem_tokens[chunk],
-                                            drop_mask_in=drop_mask[chunk],
-                                            edge_map_in=edge_map[chunk] if edge_map is not None else None,
-                                            tex_map_in=tex_map[chunk] if tex_map is not None else None,
+                            with use_jvp_attention_backend(jvp_attention_backend):
+                                with _jvp_sdpa_context(jvp_attention_backend):
+                                    if 0 < jvp_microbatch_size < bsz:
+                                        du_dt_chunks = []
+                                        # Split only the exact-JVP evaluation across samples.
+                                        # This preserves the objective because this path has no
+                                        # batch-dependent state such as BatchNorm.
+                                        for start in range(0, bsz, jvp_microbatch_size):
+                                            end = min(start + jvp_microbatch_size, bsz)
+                                            chunk = slice(start, end)
+                                            u_only_chunk = make_u_only(
+                                                sem_tokens_in=sem_tokens[chunk],
+                                                drop_mask_in=drop_mask[chunk],
+                                                edge_map_in=edge_map[chunk] if edge_map is not None else None,
+                                                tex_map_in=tex_map[chunk] if tex_map is not None else None,
+                                            )
+                                            _, du_dt_chunk = func_jvp(
+                                                u_only_chunk,
+                                                (z_t[chunk], t[chunk], r[chunk]),
+                                                (v_tangent[chunk], dtdt[chunk], dtdr[chunk]),
+                                            )
+                                            du_dt_chunks.append(du_dt_chunk.detach())
+                                        du_dt = torch.cat(du_dt_chunks, dim=0)
+                                        del du_dt_chunks
+                                    else:
+                                        _, du_dt = func_jvp(
+                                            u_only,
+                                            (z_t, t, r),
+                                            (v_tangent, dtdt, dtdr),
                                         )
-                                        _, du_dt_chunk = func_jvp(
-                                            u_only_chunk,
-                                            (z_t[chunk], t[chunk], r[chunk]),
-                                            (v_tangent[chunk], dtdt[chunk], dtdr[chunk]),
-                                        )
-                                        du_dt_chunks.append(du_dt_chunk.detach())
-                                    du_dt = torch.cat(du_dt_chunks, dim=0)
-                                    del du_dt_chunks
-                                else:
-                                    _, du_dt = func_jvp(
-                                        u_only,
-                                        (z_t, t, r),
-                                        (v_tangent, dtdt, dtdr),
-                                    )
-                                    du_dt = du_dt.detach()
+                                        du_dt = du_dt.detach()
                     except Exception as exc:
                         jvp_exc = exc
                 else:
