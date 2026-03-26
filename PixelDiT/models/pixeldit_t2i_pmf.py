@@ -492,6 +492,7 @@ class PixelDiTT2IPMF(nn.Module):
         sem_drop_mask: Optional[torch.Tensor] = None,
         edge_map: Optional[torch.Tensor] = None,
         tex_map: Optional[torch.Tensor] = None,
+        return_v: bool = True,
     ) -> Dict[str, torch.Tensor]:
         b, c, height, width = x.shape
         if c != self.in_channels:
@@ -567,7 +568,6 @@ class PixelDiTT2IPMF(nn.Module):
             )
 
         u_tokens = p_tokens
-        v_tokens = p_tokens
 
         for i, block in enumerate(self.u_head_blocks):
             tex_delta = None
@@ -591,6 +591,20 @@ class PixelDiTT2IPMF(nn.Module):
                     s_cond,
                     tex_delta,
                 )
+
+        u_flat = u_tokens.view(b, -1, self.pixel_dim)
+        u_out = self.u_final_layer(u_flat, c_time).view(b, l, p * p, c)
+        x_hat_u = self.unpatchify_pixels(u_out, height, width)
+
+        out = {
+            "x_hat_u": x_hat_u,
+            "c_time": c_time,
+            "s_cond": s_cond,
+        }
+        if not return_v:
+            return out
+
+        v_tokens = p_tokens
         for block in self.v_head_blocks:
             v_tokens = self._maybe_checkpoint(
                 lambda p_in, s_in: block(p_in, s_in, rope=self.patch_rope),
@@ -598,21 +612,12 @@ class PixelDiTT2IPMF(nn.Module):
                 s_cond,
             )
 
-        u_flat = u_tokens.view(b, -1, self.pixel_dim)
         v_flat = v_tokens.view(b, -1, self.pixel_dim)
-
-        u_out = self.u_final_layer(u_flat, c_time).view(b, l, p * p, c)
         v_out = self.v_final_layer(v_flat, c_time).view(b, l, p * p, c)
-
-        x_hat_u = self.unpatchify_pixels(u_out, height, width)
         x_hat_v = self.unpatchify_pixels(v_out, height, width)
+        out["x_hat_v"] = x_hat_v
 
-        return {
-            "x_hat_u": x_hat_u,
-            "x_hat_v": x_hat_v,
-            "c_time": c_time,
-            "s_cond": s_cond,
-        }
+        return out
 
 
 __all__ = ["PixelDiTT2IPMF", "PixelDiTOutput"]

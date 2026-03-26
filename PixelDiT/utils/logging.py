@@ -80,12 +80,15 @@ class ScalarWriter:
             "loss_u",
             "loss_v",
             "loss_u_raw",
+            "loss_u_raw_nonfm",
             "loss_v_raw",
             "loss_perc",
             "loss_sem",
             "loss_sem_raw",
         }:
             return f"train/loss/{k}"
+        if k == "jvp_term_rms":
+            return "train/jvp/jvp_term_rms"
         if k.startswith("aux_loss_"):
             return f"train/aux/{k}"
         if k.startswith("lambda_"):

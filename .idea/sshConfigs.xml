@@ -2,9 +2,7 @@
 <project version="4">
   <component name="SshConfigs">
     <configs>
-      <sshConfig authType="PASSWORD" host="connect.westc.gpuhub.com" id="39f3f140-06a9-4458-81f2-2a97a631a5e2" port="40506" nameFormat="DESCRIPTIVE" username="root" useOpenSSHConfig="true" />
-      <sshConfig authType="PASSWORD" host="connect.westb.seetacloud.com" id="9805f50b-92e7-46db-ab49-18ccea42182e" port="15592" nameFormat="DESCRIPTIVE" username="root" useOpenSSHConfig="true" />
-      <sshConfig authType="PASSWORD" host="connect.westd.seetacloud.com" id="e9acc5cc-6694-4255-801a-b30643f748a6" port="45201" nameFormat="DESCRIPTIVE" username="root" useOpenSSHConfig="true" />
+      <sshConfig authType="PASSWORD" host="connect.westd.seetacloud.com" id="e4f5a5d6-0d77-4478-9ccb-10bcf42b544f" port="41925" nameFormat="DESCRIPTIVE" username="root" useOpenSSHConfig="true" />
     </configs>
   </component>
 </project>

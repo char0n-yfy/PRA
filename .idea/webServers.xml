@@ -2,15 +2,8 @@
 <project version="4">
   <component name="WebServers">
     <option name="servers">
-      <webServer id="1e080ccd-6663-47d5-acd2-84cb6275ffbf" name="pmf">
-        <fileTransfer rootFolder="/root" accessType="SFTP" host="connect.westc.gpuhub.com" port="40506" sshConfigId="39f3f140-06a9-4458-81f2-2a97a631a5e2" sshConfig="root@connect.westc.gpuhub.com:40506 password">
-          <advancedOptions>
-            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
-          </advancedOptions>
-        </fileTransfer>
-      </webServer>
-      <webServer id="3a7b2482-934b-41ed-97cf-06e35187508e" name="pmf_pro6000">
-        <fileTransfer rootFolder="/root" accessType="SFTP" host="connect.westd.seetacloud.com" port="45201" sshConfigId="e9acc5cc-6694-4255-801a-b30643f748a6" sshConfig="root@connect.westd.seetacloud.com:45201 password">
+      <webServer id="552b8c5d-6293-4567-93e4-dbc08a213295" name="pmf">
+        <fileTransfer rootFolder="/root" accessType="SFTP" host="connect.westd.seetacloud.com" port="41925" sshConfigId="e4f5a5d6-0d77-4478-9ccb-10bcf42b544f" sshConfig="root@connect.westd.seetacloud.com:41925 password">
           <advancedOptions>
             <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
           </advancedOptions>

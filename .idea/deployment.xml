@@ -9,13 +9,6 @@
           </mappings>
         </serverdata>
       </paths>
-      <paths name="pmf_pro6000">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/autodl-tmp/pmf" local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
     </serverData>
   </component>
 </project>

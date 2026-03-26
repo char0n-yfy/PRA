@@ -1,0 +1,192 @@
+dataset:
+  # Match the outer pMF configs (edit if your dataset is elsewhere).
+  root: /root/autodl-tmp/imagenet
+  image_size: 512
+  train_split: train
+  val_split: val
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  use_flip: false
+  augment_train: false
+
+semantic:
+  # Online DINO extraction (no offline cache).
+  use_offline_cache: false
+  # Unused when use_offline_cache=false. Kept for easy switching.
+  cache_root: /root/autodl-tmp/imagenet_sem_cache_fp32_512
+  mode: dino
+  # Local HF snapshot dir (recommended for offline runs) or a HF repo id.
+  dino_model_name: /root/autodl-tmp/hf_models/dinov2-base
+  dino_use_dense: true
+  dino_image_size: 512
+  dino_feature_dim: 768
+  # Only used for offline-cache validation/shape when use_offline_cache=true.
+  num_dino_tokens: 4
+  strict: true
+
+spatial:
+  # Keep spatial parameters aligned across configs; only the enable flag changes.
+  enable_edge: true
+  # Edge preprocessing (computed from clean x during training).
+  edge_blur_sigma: 1.0
+  edge_threshold: 0.0
+  # SpatialNet output channels (C_e). Typical: 64 or 128.
+  edge_channels: 64
+
+texture:
+  # Keep texture parameters aligned across configs; only the enable flag changes.
+  enable: true
+  in_channels: 12
+  channels: 64
+  res_blocks: 2
+  inject_u_head: true
+  # 3-level stationary Haar high bands (9) + 2 DoG bands + edge magnitude = 12 channels.
+  wavelet_levels: 3
+  dog_sigmas:
+    - [0.8, 1.6]
+    - [1.6, 3.2]
+  norm_quantile: 0.95
+  norm_clip: 3.0
+  norm_stats_stride: 4
+
+model:
+  input_size: 512
+  patch_size: 16
+  in_channels: 3
+  # PixelDiT-T2I-1B: N=14, M=2, D=1536, D_pix=16, heads=24.
+  hidden_size: 1536
+  pixel_dim: 16
+  patch_depth: 14
+  pixel_depth: 2
+  pixel_head_depth: 1
+  num_heads: 24
+  pixel_num_heads: 24
+  mlp_ratio: 4.0
+  sem_in_dim: 768
+  sem_num_tokens: 64
+  sem_pool_num_heads: 12
+  use_qknorm: true
+  use_swiglu: true
+  use_rope: true
+  use_rmsnorm: true
+  use_checkpoint: false
+  null_token_learnable: true
+
+training:
+  seed: 42
+  num_epochs: 30
+  # Global batch size. Must be divisible by world_size.
+  batch_size: 36
+  gradient_accumulation_steps: 1
+  # Match outer pMF naming (steps between scalar logs).
+  log_per_step: 100
+  learning_rate: 1e-4
+  weight_decay: 0.0
+  grad_clip: 0.5
+  use_amp: true
+  amp_dtype: bf16
+  class_dropout_prob: 0.1
+  noise_scale: 2.0
+  t_eps: 0.025
+  # Tangent experiment: use conditioned v_pred for JVP, recomputing only the
+  # dropped subset (drop_mask=True) with a cond-only forward.
+  jvp_tangent_mode: vcond_subbatch
+
+time_sampling:
+  data_proportion: 0.5
+  # Align with outer pMF sampling (t,r ~ sigmoid(N(P_mean,P_std)) with optional tr_uniform mixing).
+  P_mean: 0.0
+  P_std: 0.8
+  tr_uniform: true
+  tr_uniform_prob: 0.1
+
+loss:
+  norm_p: 0.5
+  norm_eps: 0.001
+  # Perceptual losses only apply to low-noise samples (t <= perceptual_max_t).
+  # Recommended default for attack/regeneration training: 0.4
+  perceptual_max_t: 0.4
+  lpips_weight: 0.4
+  convnext_weight: 0.1
+  enable_lpips: true
+  enable_convnext: true
+  # Local HF snapshot dir (recommended for offline runs) or a HF repo id.
+  convnext_model_name: /root/autodl-tmp/hf_models/convnextv2-base-22k-224
+
+evaluation:
+  enabled: false
+  run_every_n_epochs: 1
+  fail_on_error: false
+  # Force single-process dataloader inside in-training epoch-end eval to avoid
+  # semaphore/worker cleanup crashes under torchrun + Python 3.12.
+  epoch_end_num_workers: 0
+  epoch_max_samples: 64
+  max_samples: 1000
+  batch_size: 20
+  num_workers: 8
+  seed: 123
+  t_eps: 0.025
+  posthoc_t_values: [0.05, 0.10, 0.20, 0.30]
+  regen_t_values: [0.80, 0.90, 1.00]
+  regen_num_variants: 4
+  sweep:
+    posthoc:
+      num_steps: [1]
+      omegas: [1.0, 1.5]
+      intervals:
+        - [0.0, 1.0]
+    regen:
+      num_steps: [1, 2]
+      omegas: [1.0, 4.0]
+      intervals:
+        - [0.1, 0.9]
+  metrics:
+    enable_clip: true
+    clip_model_name: /root/autodl-tmp/hf_models/clip-vit-large-patch14
+  best:
+    enabled: true
+    save_overall: false
+    min_improvement: 1.0e-6
+    posthoc_lpips_weight: 10.0
+    regen_clip_weight: 0.5
+    regen_div_weight: 0.3
+    overall_posthoc_weight: 0.5
+    overall_regen_weight: 0.5
+  visualization:
+    save: true
+    to_tensorboard: true
+    num_images: 8
+    regen_show_variants: 4
+
+logging:
+  tb: true
+  # Flush tensorboard event file every N scalar writes (reduce fsync/io overhead).
+  tb_flush_every: 100
+
+diagnostics:
+  # Low-frequency probes for CFG branch separation and edge-conditioning usage.
+  cfg_probe_interval: 50000
+  cfg_probe_batch_size: 28
+
+checkpoint:
+  save_interval: 100000
+  save_per_epoch: true
+  keep_last_k: 1
+
+ddp:
+  backend: nccl
+  find_unused_parameters: false
+
+resume:
+  enabled: false
+  checkpoint: ""
+  workdir: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf_vcond_subbatch_sem_edge_tex
+  strict_model: true
+  optimizer: true
+  scaler: true
+  rng_state: true
+  # Keep optimizer/scaler state, but force lr/wd to follow the current config.
+  override_lr_from_config: true
+  override_weight_decay_from_config: false

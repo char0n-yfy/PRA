@@ -257,6 +257,8 @@ def _save_checkpoint(workdir: str, state: TrainState, model, optimizer, scaler, 
     )
 
     all_ckpts = sorted(Path(ckpt_dir).glob("checkpoint_step_*.pt"))
+    if int(keep_last_k) <= 0:
+        return
     if len(all_ckpts) > int(keep_last_k):
         stale = all_ckpts[: len(all_ckpts) - int(keep_last_k)]
         for p in stale:
@@ -707,8 +709,19 @@ def train(cfg, workdir: str):
     jvp_tangent_lambda = float(getattr(cfg.training, "jvp_tangent_lambda", 0.25))
     if not (0.0 <= jvp_tangent_lambda <= 1.0):
         raise ValueError("training.jvp_tangent_lambda must be in [0,1].")
-    if is_main_process() and (not use_func_jvp):
-        rank0_info("JVP backend: finite-difference (torch.func.jvp disabled; set training.use_func_jvp=true to opt in).")
+    jvp_microbatch_size = int(getattr(cfg.training, "jvp_microbatch_size", 0))
+    if jvp_microbatch_size < 0:
+        raise ValueError("training.jvp_microbatch_size must be >= 0.")
+    if is_main_process():
+        if use_func_jvp and (func_jvp is not None):
+            if jvp_microbatch_size > 0:
+                rank0_info(f"JVP backend: torch.func.jvp (microbatch={jvp_microbatch_size}).")
+            else:
+                rank0_info("JVP backend: torch.func.jvp (full local batch).")
+        elif use_func_jvp:
+            rank0_info("JVP backend: finite-difference (torch.func.jvp unavailable in this torch build).")
+        else:
+            rank0_info("JVP backend: finite-difference (torch.func.jvp disabled; set training.use_func_jvp=true to opt in).")
     if is_main_process():
         if jvp_tangent_mode == "vt":
             rank0_info("JVP tangent: data velocity v_t.")
@@ -805,7 +818,7 @@ def train(cfg, workdir: str):
                 assert dino_encoder is not None
                 sem_tokens = dino_encoder.encode(images, amp_dtype=amp_dtype)
 
-            t, r, _fm_mask = sample_tr(
+            t, r, fm_mask = sample_tr(
                 batch_size=bsz,
                 device=device,
                 dtype=images.dtype,
@@ -870,18 +883,29 @@ def train(cfg, workdir: str):
                     else:
                         v_tangent = ((1.0 - jvp_tangent_lambda) * v_t + jvp_tangent_lambda * v_cond_pred).detach()
 
-                def u_only(z_in, t_in, r_in):
-                    out_u = model(
-                        x=z_in,
-                        t=t_in.reshape(-1),
-                        h=(t_in - r_in).reshape(-1),
-                        sem_tokens=sem_tokens,
-                        sem_mask=None,
-                        sem_drop_mask=drop_mask,
-                        edge_map=edge_map,
-                        tex_map=tex_map,
-                    )["x_hat_u"]
-                    return (z_in - out_u) / torch.clamp(t_in, min=t_eps)
+                def make_u_only(sem_tokens_in, drop_mask_in, edge_map_in, tex_map_in):
+                    def _u_only(z_in, t_in, r_in):
+                        out_u = model(
+                            x=z_in,
+                            t=t_in.reshape(-1),
+                            h=(t_in - r_in).reshape(-1),
+                            sem_tokens=sem_tokens_in,
+                            sem_mask=None,
+                            sem_drop_mask=drop_mask_in,
+                            edge_map=edge_map_in,
+                            tex_map=tex_map_in,
+                            return_v=False,
+                        )["x_hat_u"]
+                        return (z_in - out_u) / torch.clamp(t_in, min=t_eps)
+
+                    return _u_only
+
+                u_only = make_u_only(
+                    sem_tokens_in=sem_tokens,
+                    drop_mask_in=drop_mask,
+                    edge_map_in=edge_map,
+                    tex_map_in=tex_map,
+                )
 
                 dtdt = torch.ones_like(t)
                 dtdr = torch.zeros_like(t)
@@ -890,11 +914,33 @@ def train(cfg, workdir: str):
                 if use_func_jvp and (func_jvp is not None):
                     try:
                         with _jvp_sdpa_context():
-                            _, du_dt = func_jvp(
-                                u_only,
-                                (z_t, t, r),
-                                (v_tangent, dtdt, dtdr),
-                            )
+                            if 0 < jvp_microbatch_size < bsz:
+                                du_dt_chunks = []
+                                # Split only the exact-JVP evaluation across samples.
+                                # This preserves the objective because this path has no
+                                # batch-dependent state such as BatchNorm.
+                                for start in range(0, bsz, jvp_microbatch_size):
+                                    end = min(start + jvp_microbatch_size, bsz)
+                                    chunk = slice(start, end)
+                                    u_only_chunk = make_u_only(
+                                        sem_tokens_in=sem_tokens[chunk],
+                                        drop_mask_in=drop_mask[chunk],
+                                        edge_map_in=edge_map[chunk] if edge_map is not None else None,
+                                        tex_map_in=tex_map[chunk] if tex_map is not None else None,
+                                    )
+                                    _, du_dt_chunk = func_jvp(
+                                        u_only_chunk,
+                                        (z_t[chunk], t[chunk], r[chunk]),
+                                        (v_tangent[chunk], dtdt[chunk], dtdr[chunk]),
+                                    )
+                                    du_dt_chunks.append(du_dt_chunk)
+                                du_dt = torch.cat(du_dt_chunks, dim=0)
+                            else:
+                                _, du_dt = func_jvp(
+                                    u_only,
+                                    (z_t, t, r),
+                                    (v_tangent, dtdt, dtdr),
+                                )
                     except Exception as exc:
                         jvp_exc = exc
                 else:
@@ -912,19 +958,25 @@ def train(cfg, workdir: str):
                         u_eps = u_only(z_eps, t_eps_fd, r_eps)
                         du_dt = (u_eps - u_pred.detach()) / fd_eps
                     if use_func_jvp and (not jvp_fallback_emitted) and is_main_process():
-                        print(
+                        exc_tb = "".join(
+                            traceback.format_exception(type(jvp_exc), jvp_exc, jvp_exc.__traceback__)
+                        ).strip()
+                        rank0_info(
                             "\n"
                             + "=" * 100
                             + "\n[JVP-FALLBACK] torch.func.jvp failed, switched to finite-difference JVP.\n"
                             + f"Reason: {type(jvp_exc).__name__}: {jvp_exc}\n"
                             + f"fd_eps={fd_eps}\n"
-                            + "This warning is shown once per run."
+                            + "Traceback:\n"
+                            + exc_tb
+                            + "\nThis warning is shown once per run."
                             + "\n"
                             + "=" * 100
                             + "\n"
                         )
                         jvp_fallback_emitted = True
-                V = u_pred + (t - r) * du_dt.detach()
+                jvp_term = (t - r) * du_dt.detach()
+                V = u_pred + jvp_term
 
                 loss_u_raw_vec = torch.mean((V - v_t) ** 2, dim=(1, 2, 3))
                 loss_u_vec = torch.sum((V - v_t) ** 2, dim=(1, 2, 3))
@@ -1067,6 +1119,12 @@ def train(cfg, workdir: str):
                 lpips_vec=lpips_vec,
                 convnext_vec=convnext_vec,
             )
+            nonfm_mask = (~fm_mask.reshape(-1)).to(dtype=torch.bool)
+            if bool(nonfm_mask.any().item()):
+                metrics["loss_u_raw_nonfm"] = loss_u_raw_vec[nonfm_mask].detach().mean()
+            else:
+                metrics["loss_u_raw_nonfm"] = loss_u_raw_vec.detach().new_zeros(())
+            metrics["jvp_term_rms"] = torch.sqrt(torch.mean(jvp_term.float() ** 2) + 1e-12).detach()
             metrics["cond_drop_ratio"] = drop_mask.float().mean().detach()
             metrics["lr"] = torch.tensor(optimizer.param_groups[0]["lr"], device=device)
 
