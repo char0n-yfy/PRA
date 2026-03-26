@@ -493,6 +493,7 @@ class PixelDiTT2IPMF(nn.Module):
         edge_map: Optional[torch.Tensor] = None,
         tex_map: Optional[torch.Tensor] = None,
         return_v: bool = True,
+        return_aux: bool = False,
     ) -> Dict[str, torch.Tensor]:
         b, c, height, width = x.shape
         if c != self.in_channels:
@@ -596,11 +597,10 @@ class PixelDiTT2IPMF(nn.Module):
         u_out = self.u_final_layer(u_flat, c_time).view(b, l, p * p, c)
         x_hat_u = self.unpatchify_pixels(u_out, height, width)
 
-        out = {
-            "x_hat_u": x_hat_u,
-            "c_time": c_time,
-            "s_cond": s_cond,
-        }
+        out = {"x_hat_u": x_hat_u}
+        if return_aux:
+            out["c_time"] = c_time
+            out["s_cond"] = s_cond
         if not return_v:
             return out
 

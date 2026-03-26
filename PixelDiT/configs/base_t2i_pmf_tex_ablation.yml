@@ -90,6 +90,11 @@ training:
   class_dropout_prob: 0.1
   noise_scale: 2.0
   t_eps: 0.025
+  # Prefer exact forward-mode JVP over finite-difference fallback.
+  use_func_jvp: true
+  # Split exact JVP into smaller per-rank chunks to reduce peak activation memory
+  # without changing the underlying u/JVP objective.
+  jvp_microbatch_size: 9
 
 time_sampling:
   data_proportion: 0.5
@@ -103,8 +108,8 @@ loss:
   norm_p: 0.5
   norm_eps: 0.001
   # Perceptual losses only apply to low-noise samples (t <= perceptual_max_t).
-  # Recommended default for attack/regeneration training: 0.4
-  perceptual_max_t: 0.4
+  # Recommended default for attack/regeneration training: 0.6
+  perceptual_max_t: 0.6
   lpips_weight: 0.4
   convnext_weight: 0.1
   enable_lpips: true
@@ -164,8 +169,8 @@ logging:
 
 diagnostics:
   # Low-frequency probes for CFG branch separation and edge-conditioning usage.
-  cfg_probe_interval: 50000
-  cfg_probe_batch_size: 28
+  cfg_probe_interval: 0
+  cfg_probe_batch_size: 0
 
 checkpoint:
   save_interval: 100000

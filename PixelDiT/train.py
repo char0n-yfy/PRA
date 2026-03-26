@@ -852,9 +852,11 @@ def train(cfg, workdir: str):
                 )
                 x_hat_u = out["x_hat_u"]
                 x_hat_v = out["x_hat_v"]
+                del out
 
                 u_pred = (z_t - x_hat_u) / t_clamp
                 v_pred = (z_t - x_hat_v) / t_clamp
+                del x_hat_v
 
                 v_tangent = v_t.detach()
                 if jvp_tangent_mode != "vt":
@@ -876,8 +878,10 @@ def train(cfg, workdir: str):
                                 tex_map=tex_sub,
                             )
                             x_hat_v_cond_sub = out_cond_sub["x_hat_v"]
+                            del out_cond_sub
                             v_cond_pred = v_cond_pred.clone()
                             v_cond_pred[idx] = (z_t[idx] - x_hat_v_cond_sub) / t_clamp[idx]
+                            del x_hat_v_cond_sub
                     if jvp_tangent_mode == "vcond_subbatch":
                         v_tangent = v_cond_pred.detach()
                     else:
@@ -895,6 +899,7 @@ def train(cfg, workdir: str):
                             edge_map=edge_map_in,
                             tex_map=tex_map_in,
                             return_v=False,
+                            return_aux=False,
                         )["x_hat_u"]
                         return (z_in - out_u) / torch.clamp(t_in, min=t_eps)
 
@@ -913,34 +918,37 @@ def train(cfg, workdir: str):
                 jvp_exc = None
                 if use_func_jvp and (func_jvp is not None):
                     try:
-                        with _jvp_sdpa_context():
-                            if 0 < jvp_microbatch_size < bsz:
-                                du_dt_chunks = []
-                                # Split only the exact-JVP evaluation across samples.
-                                # This preserves the objective because this path has no
-                                # batch-dependent state such as BatchNorm.
-                                for start in range(0, bsz, jvp_microbatch_size):
-                                    end = min(start + jvp_microbatch_size, bsz)
-                                    chunk = slice(start, end)
-                                    u_only_chunk = make_u_only(
-                                        sem_tokens_in=sem_tokens[chunk],
-                                        drop_mask_in=drop_mask[chunk],
-                                        edge_map_in=edge_map[chunk] if edge_map is not None else None,
-                                        tex_map_in=tex_map[chunk] if tex_map is not None else None,
+                        with torch.no_grad():
+                            with _jvp_sdpa_context():
+                                if 0 < jvp_microbatch_size < bsz:
+                                    du_dt_chunks = []
+                                    # Split only the exact-JVP evaluation across samples.
+                                    # This preserves the objective because this path has no
+                                    # batch-dependent state such as BatchNorm.
+                                    for start in range(0, bsz, jvp_microbatch_size):
+                                        end = min(start + jvp_microbatch_size, bsz)
+                                        chunk = slice(start, end)
+                                        u_only_chunk = make_u_only(
+                                            sem_tokens_in=sem_tokens[chunk],
+                                            drop_mask_in=drop_mask[chunk],
+                                            edge_map_in=edge_map[chunk] if edge_map is not None else None,
+                                            tex_map_in=tex_map[chunk] if tex_map is not None else None,
+                                        )
+                                        _, du_dt_chunk = func_jvp(
+                                            u_only_chunk,
+                                            (z_t[chunk], t[chunk], r[chunk]),
+                                            (v_tangent[chunk], dtdt[chunk], dtdr[chunk]),
+                                        )
+                                        du_dt_chunks.append(du_dt_chunk.detach())
+                                    du_dt = torch.cat(du_dt_chunks, dim=0)
+                                    del du_dt_chunks
+                                else:
+                                    _, du_dt = func_jvp(
+                                        u_only,
+                                        (z_t, t, r),
+                                        (v_tangent, dtdt, dtdr),
                                     )
-                                    _, du_dt_chunk = func_jvp(
-                                        u_only_chunk,
-                                        (z_t[chunk], t[chunk], r[chunk]),
-                                        (v_tangent[chunk], dtdt[chunk], dtdr[chunk]),
-                                    )
-                                    du_dt_chunks.append(du_dt_chunk)
-                                du_dt = torch.cat(du_dt_chunks, dim=0)
-                            else:
-                                _, du_dt = func_jvp(
-                                    u_only,
-                                    (z_t, t, r),
-                                    (v_tangent, dtdt, dtdr),
-                                )
+                                    du_dt = du_dt.detach()
                     except Exception as exc:
                         jvp_exc = exc
                 else:
