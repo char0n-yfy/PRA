@@ -30,7 +30,7 @@ spatial:
   # Keep spatial parameters aligned across configs; only the enable flag changes.
   enable_edge: false
   # Edge preprocessing (computed from clean x during training).
-  edge_blur_sigma: 1.0
+  edge_blur_sigma: 0.0
   edge_threshold: 0.0
   # SpatialNet output channels (C_e). Typical: 64 or 128.
   edge_channels: 64

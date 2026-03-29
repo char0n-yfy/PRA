@@ -27,8 +27,8 @@ semantic:
   strict: true
 
 spatial:
-  # Optional spatial (edge) condition injection into the patch-level image stream.
-  enable_edge: true
+  # Keep spatial parameters aligned across configs; only the enable flag changes.
+  enable_edge: false
   # Edge preprocessing (computed from clean x during training).
   edge_blur_sigma: 0.0
   edge_threshold: 0.0
@@ -36,8 +36,20 @@ spatial:
   edge_channels: 64
 
 texture:
-  # Keep the base configuration on the original no-texture path.
-  enable: false
+  # Keep texture parameters aligned across configs; only the enable flag changes.
+  enable: true
+  in_channels: 12
+  channels: 64
+  res_blocks: 2
+  inject_u_head: true
+  # 3-level stationary Haar high bands (9) + 2 DoG bands + edge magnitude = 12 channels.
+  wavelet_levels: 3
+  dog_sigmas:
+    - [0.8, 1.6]
+    - [1.6, 3.2]
+  norm_quantile: 0.95
+  norm_clip: 3.0
+  norm_stats_stride: 4
 
 model:
   input_size: 512
@@ -53,7 +65,7 @@ model:
   pixel_num_heads: 24
   mlp_ratio: 4.0
   sem_in_dim: 768
-  sem_num_tokens: 64
+  sem_num_tokens: 128
   sem_pool_num_heads: 12
   use_qknorm: true
   use_swiglu: true
@@ -78,8 +90,9 @@ training:
   class_dropout_prob: 0.1
   noise_scale: 2.0
   t_eps: 0.025
-  # Baseline JVP tangent: data-derived sample-conditional velocity v_t.
-  jvp_tangent_mode: vt
+  # Tangent experiment: use conditioned v_pred for JVP, recomputing only the
+  # dropped subset (drop_mask=True) with a cond-only forward.
+  jvp_tangent_mode: vcond_subbatch
   # Prefer exact forward-mode JVP over finite-difference fallback.
   use_func_jvp: true
   # Attention backend used only inside exact-JVP evaluation.
@@ -112,7 +125,7 @@ loss:
   convnext_model_name: /root/autodl-tmp/hf_models/convnextv2-base-22k-224
 
 evaluation:
-  enabled: true
+  enabled: false
   run_every_n_epochs: 1
   fail_on_error: false
   # Force single-process dataloader inside in-training epoch-end eval to avoid
@@ -169,16 +182,17 @@ diagnostics:
 checkpoint:
   save_interval: 100000
   save_per_epoch: true
-  keep_last_k: 1
+  # 0 means keep all checkpoints; with save_per_epoch=true this preserves every epoch-end weight.
+  keep_last_k: 0
 
 ddp:
   backend: nccl
   find_unused_parameters: false
 
 resume:
-  enabled: true
-  checkpoint: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf/20260306-111136/checkpoints/checkpoint_step_00106761.pt
-  workdir: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf/20260306-111136
+  enabled: false
+  checkpoint: ""
+  workdir: /root/autodl-tmp/pmf/output/PixelDiT_base_t2i_pmf_vcond_subbatch_sem_tex
   strict_model: true
   optimizer: true
   scaler: true

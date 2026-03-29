@@ -30,7 +30,7 @@ spatial:
   # Keep spatial parameters aligned across configs; only the enable flag changes.
   enable_edge: true
   # Edge preprocessing (computed from clean x during training).
-  edge_blur_sigma: 1.0
+  edge_blur_sigma: 0.0
   edge_threshold: 0.0
   # SpatialNet output channels (C_e). Typical: 64 or 128.
   edge_channels: 64
@@ -65,7 +65,7 @@ model:
   pixel_num_heads: 24
   mlp_ratio: 4.0
   sem_in_dim: 768
-  sem_num_tokens: 64
+  sem_num_tokens: 128
   sem_pool_num_heads: 12
   use_qknorm: true
   use_swiglu: true
@@ -182,7 +182,8 @@ diagnostics:
 checkpoint:
   save_interval: 100000
   save_per_epoch: true
-  keep_last_k: 1
+  # 0 means keep all checkpoints; with save_per_epoch=true this preserves every epoch-end weight.
+  keep_last_k: 0
 
 ddp:
   backend: nccl
